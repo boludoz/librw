@@ -301,7 +301,12 @@ decompressDXT5(uint8 *adst, int32 w, int32 h, uint8 *src)
 			indices >>= 2;
 		}
 		// only 6 indices
+#if defined(__ANDROID__) || defined(ANDROID)
+		uint64 alphas = 0;
+		memcpy(&alphas, src+j+2, sizeof(alphas));
+#else
 		uint64 alphas = *((uint64*)&src[j+2]);
+#endif
 		for(int32 k = 0; k < 16; k++){
 			aidx[k] = alphas & 0x7;
 			alphas >>= 3;

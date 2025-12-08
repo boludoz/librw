@@ -549,7 +549,7 @@ rasterUnlock(Raster *raster, int32 level)
 					memcpy(natras->backingStore->levels[level].data, raster->pixels,
 						natras->backingStore->levels[level].size);
 				}
-			}else{
+			} else if(level == 0) {
 				glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 				glTexImage2D(GL_TEXTURE_2D, level, natras->internalFormat,
 					     raster->width, raster->height,
