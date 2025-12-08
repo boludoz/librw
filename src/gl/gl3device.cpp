@@ -1,21 +1,21 @@
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 
 #include "../rwbase.h"
+#include "../rwengine.h"
 #include "../rwerror.h"
+#include "../rwobjects.h"
+#include "../rwpipeline.h"
 #include "../rwplg.h"
 #include "../rwrender.h"
-#include "../rwengine.h"
-#include "../rwpipeline.h"
-#include "../rwobjects.h"
 
 #ifdef RW_OPENGL
 
 #include "rwgl3.h"
-#include "rwgl3shader.h"
 #include "rwgl3impl.h"
+#include "rwgl3shader.h"
 
 #define PLUGIN_ID 0
 
