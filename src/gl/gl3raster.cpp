@@ -555,7 +555,7 @@ rasterUnlock(Raster *raster, int32 level)
 					     raster->width, raster->height,
 					     0, natras->format, natras->type, raster->pixels);
 			}
-			if(level == 0 && natras->autogenMipmap)
+			// if(level == 0 && natras->autogenMipmap)
 				glGenerateMipmap(GL_TEXTURE_2D);
 			bindTexture(prev);
 		}

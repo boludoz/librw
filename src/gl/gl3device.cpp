@@ -1718,12 +1718,17 @@ makeVideoModeList(SDL_DisplayID displayIndex, SDL_DisplayID *displays)
 	modes = SDL_GetFullscreenDisplayModes(displayIndex, &num);
 
 	rwFree(glGlobals.modes);
-	glGlobals.modes = rwNewT(DisplayMode, num+(currentMode != NULL ? 1 : 0), ID_DRIVER | MEMDUR_EVENT);
+	glGlobals.modes = rwNewT(DisplayMode, num+(currentMode != NULL ? 1 : 0)+1, ID_DRIVER | MEMDUR_EVENT);
 	glGlobals.numModes = 0;
 
 	if (currentMode) {
 		glGlobals.modes[0].mode = *currentMode;
+#if defined(__ANDROID__) || defined(ANDROID)
+		// Android always runs fullscreen, so mark the mode as exclusive
+		glGlobals.modes[0].flags = VIDEOMODEEXCLUSIVE;
+#else
 		glGlobals.modes[0].flags = 0;
+#endif
 		glGlobals.numModes = 1;
 	}
 
