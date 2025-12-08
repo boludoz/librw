@@ -1585,7 +1585,8 @@ startSDL2(void)
 				SDL_SetWindowDisplayMode(win, &mode->mode);
 		} else {
 #if defined(__ANDROID__) || defined(ANDROID)
-			win = SDL_CreateWindow(glGlobals.winTitle, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, glGlobals.winWidth, glGlobals.winHeight, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN);
+			// Use 0,0 to let SDL use the native screen resolution
+			win = SDL_CreateWindow(glGlobals.winTitle, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 0, 0, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN);
 #else
 			win = SDL_CreateWindow(glGlobals.winTitle, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, glGlobals.winWidth, glGlobals.winHeight, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
 #endif
@@ -1718,6 +1719,7 @@ makeVideoModeList(SDL_DisplayID displayIndex, SDL_DisplayID *displays)
 
 	rwFree(glGlobals.modes);
 	glGlobals.modes = rwNewT(DisplayMode, num+(currentMode != NULL ? 1 : 0), ID_DRIVER | MEMDUR_EVENT);
+	glGlobals.numModes = 0;
 
 	if (currentMode) {
 		glGlobals.modes[0].mode = *currentMode;
@@ -1807,7 +1809,8 @@ startSDL3(void)
 				SDL_SetWindowFullscreenMode(win, &mode->mode);
 		} else {
 #if defined(__ANDROID__) || defined(ANDROID)
-			win = SDL_CreateWindow(glGlobals.winTitle, glGlobals.winWidth, glGlobals.winHeight, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN);
+			// Use 0,0 to let SDL use the native screen resolution
+			win = SDL_CreateWindow(glGlobals.winTitle, 0, 0, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN);
 #else
 			win = SDL_CreateWindow(glGlobals.winTitle, glGlobals.winWidth, glGlobals.winHeight, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
 #endif
