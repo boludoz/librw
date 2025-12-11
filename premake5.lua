@@ -45,8 +45,8 @@ workspace "librw"
 	configurations { "Release", "Debug" }
 	filter { "system:windows" }
 		configurations { "ReleaseStatic" }
-		platforms { "win-x86-null", "win-x86-gl3", "win-x86-d3d9",
-			"win-amd64-null", "win-amd64-gl3", "win-amd64-d3d9" }
+		platforms { "win-x86-null", "win-x86-gl3", "win-x86-d3d9", "win-x86-vulkan",
+			"win-amd64-null", "win-amd64-gl3", "win-amd64-d3d9", "win-amd64-vulkan" }
 	filter { "system:linux" }
 		platforms { "linux-x86-null", "linux-x86-gl3",
 		"linux-amd64-null", "linux-amd64-gl3",
@@ -70,6 +70,15 @@ workspace "librw"
 		defines { "RW_NULL" }
 	filter { "platforms:*gl3" }
 		defines { "RW_GL3" }
+		if _OPTIONS["gfxlib"] == "sdl2" then
+			defines { "LIBRW_SDL2" }
+		elseif _OPTIONS["gfxlib"] == "sdl3" then
+			defines { "LIBRW_SDL3" }
+		elseif _OPTIONS["gfxlib"] == "glfw" then
+			defines { "LIBRW_GLFW" }
+		end
+	filter { "platforms:*vulkan" }
+		defines { "RW_VULKAN" }
 		if _OPTIONS["gfxlib"] == "sdl2" then
 			defines { "LIBRW_SDL2" }
 		elseif _OPTIONS["gfxlib"] == "sdl3" then
@@ -128,6 +137,11 @@ project "librw"
 	files { "src/*/*.*" }
 	filter { "platforms:*gl3" }
 		files { "src/gl/glad/*.*" }
+	filter { "platforms:*vulkan" }
+		files { "src/vulkan/*.*" }
+		files { "libRHI/*.*" }
+		files { "libRHI/**/*.*" }
+		includedirs { "libRHI" }
 
 project "dumprwtree"
 	kind "ConsoleApp"
@@ -158,6 +172,33 @@ function findlibs()
 		libdirs { path.join(_OPTIONS["sdl3dir"], "lib/x86") }
 	filter { "platforms:win*gl3" }
 		links { "opengl32" }
+		if _OPTIONS["gfxlib"] == "glfw" then
+			links { "glfw3" }
+		elseif _OPTIONS["gfxlib"] == "sdl2" then
+			links { "SDL2" }
+		elseif _OPTIONS["gfxlib"] == "sdl3" then
+			links { "SDL3" }
+		end
+	-- Vulkan platforms
+	filter { "platforms:linux*vulkan" }
+		links { "vulkan" }
+		if _OPTIONS["gfxlib"] == "glfw" then
+			links { "glfw" }
+		elseif _OPTIONS["gfxlib"] == "sdl2" then
+			links { "SDL2" }
+		elseif _OPTIONS["gfxlib"] == "sdl3" then
+			links { "SDL3" }
+		end
+	filter { "platforms:win-amd64-vulkan" }
+		libdirs { path.join(_OPTIONS["glfwdir64"], "lib-vc2015") }
+		libdirs { path.join(_OPTIONS["sdl2dir"], "lib/x64") }
+		libdirs { path.join(_OPTIONS["sdl3dir"], "lib/x64") }
+	filter { "platforms:win-x86-vulkan" }
+		libdirs { path.join(_OPTIONS["glfwdir32"], "lib-vc2015") }
+		libdirs { path.join(_OPTIONS["sdl2dir"], "lib/x86") }
+		libdirs { path.join(_OPTIONS["sdl3dir"], "lib/x86") }
+	filter { "platforms:win*vulkan" }
+		links { "vulkan-1" }
 		if _OPTIONS["gfxlib"] == "glfw" then
 			links { "glfw3" }
 		elseif _OPTIONS["gfxlib"] == "sdl2" then
@@ -270,13 +311,13 @@ project "ska2anm"
 	libdirs { Libdir }
 	links { "librw" }
 	findlibs()
-	removeplatforms { "*gl3", "*d3d9", "*ps2" }
+	removeplatforms { "*gl3", "*d3d9", "*ps2", "*vulkan" }
 
 project "ps2test"
 	kind "ConsoleApp"
 	targetdir (Bindir)
 	vucode()
-	removeplatforms { "*gl3", "*d3d9", "*null" }
+	removeplatforms { "*gl3", "*d3d9", "*null", "*vulkan" }
 	targetextension '.elf'
 	includedirs { "." }
 	files { "tools/ps2test/*.cpp",
@@ -284,6 +325,18 @@ project "ps2test"
 	        "tools/ps2test/*.h" }
 	libdirs { "$(PS2SDK)/ee/lib" }
 	links { "librw" }
+
+project "vulkantest"
+	kind "ConsoleApp"
+	characterset ("MBCS")
+	targetdir (Bindir)
+	removeplatforms { "*gl3", "*d3d9", "*null", "ps2" }
+	includedirs { ".", "libRHI" }
+	files { "tools/vulkantest/*.cpp",
+	        "tools/vulkantest/*.h" }
+	libdirs { Libdir }
+	links { "librw" }
+	findlibs()
 
 --project "ps2rastertest"
 --	kind "ConsoleApp"

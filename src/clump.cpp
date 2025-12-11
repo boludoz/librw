@@ -388,7 +388,16 @@ Clump::render(void)
 			a->render();
 	}
 }
-
+void
+Clump::beginUpdate(void)
+{
+	Atomic* a;
+	FORLIST(lnk, this->atomics) {
+		a = Atomic::fromClump(lnk);
+		if (a->object.object.flags & Atomic::RENDER)
+			a->beginUpdate();
+	}
+}
 //
 // Atomic
 //
@@ -430,6 +439,7 @@ Atomic::create(void)
 	atomic->inClump.init();
 	atomic->pipeline = nil;
 	atomic->renderCB = Atomic::defaultRenderCB;
+	atomic->beginUpdateCB = Atomic::defaultUpdateCB;
 	atomic->object.object.flags = Atomic::COLLISIONTEST | Atomic::RENDER;
 	// TODO: interpolator
 
@@ -453,6 +463,7 @@ Atomic::clone()
 	if(this->geometry)
 		atomic->setGeometry(this->geometry, 0);
 	atomic->renderCB = this->renderCB;
+	atomic->beginUpdateCB = this->beginUpdateCB;
 	atomic->pipeline = this->pipeline;
 
 	// World extension doesn't add to world
@@ -626,6 +637,13 @@ Atomic::defaultRenderCB(Atomic *atomic)
 {
 	atomic->getPipeline()->render(atomic);
 }
+
+void 
+Atomic::defaultUpdateCB(Atomic* atomic)
+{
+	atomic->getPipeline()->beginUpdate(atomic);
+}
+
 
 // Atomic Rights plugin
 

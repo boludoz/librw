@@ -9,6 +9,9 @@
 #include "rwobjects.h"
 #include "rwengine.h"
 
+//todo.. refactor...
+#include "vulkan/raytracing/vktoplevel.h"
+
 #define PLUGIN_ID ID_FRAMELIST
 
 namespace rw {
@@ -245,6 +248,9 @@ void
 Frame::syncDirty(void)
 {
 	Frame *frame;
+
+	int32_t count = engine->frameDirtyList.count();
+
 	FORLIST(lnk, engine->frameDirtyList){
 		frame = LLLinkGetData(lnk, Frame, inDirtyList);
 		if(frame->object.privateFlags & Frame::HIERARCHYSYNCLTM){
@@ -262,6 +268,8 @@ Frame::syncDirty(void)
 				ObjectWithFrame::fromFrame(lnk)->sync();
 			syncObjRecurse(frame->child);
 		}
+
+		rw::tlas::updateFrame(frame);
 		// all clean now
 		frame->object.privateFlags &= ~(Frame::SYNCLTM | Frame::SYNCOBJ);
 	}

@@ -82,6 +82,23 @@ add_library(librw
     gl/glad/glad.c
     gl/glad/khrplatform.h
 
+    vulkan/rwvk.h
+    vulkan/rwvkimpl.h
+    vulkan/rwvkplg.h
+    vulkan/rwvkshader.h
+    vulkan/vk.cpp
+    vulkan/vkcache.cpp
+    vulkan/vkdevice.cpp
+    vulkan/vkimmed.cpp
+    vulkan/vklighting.cpp
+    vulkan/vklighting.h
+    vulkan/vkmatfx.cpp
+    vulkan/vkpipe.cpp
+    vulkan/vkraster.cpp
+    vulkan/vkrender.cpp
+    vulkan/vkshader.cpp
+    vulkan/vkskin.cpp
+
     lodepng/lodepng.h
     lodepng/lodepng.cpp
 
@@ -153,17 +170,13 @@ if(LIBRW_PLATFORM_GL3)
         if (NOT TARGET glfw)
             find_package(glfw3 REQUIRED)
         endif()
-        target_compile_definitions(librw PUBLIC LIBRW_GLFW)
         target_link_libraries(librw
             PUBLIC
                 glfw
             )
     elseif (LIBRW_GL3_GFXLIB STREQUAL "SDL2")
         if (NOT TARGET SDL2::SDL2)
-            find_package(SDL2 CONFIG)
-            if (NOT TARGET SDL2::SDL2)
-                find_package(SDL2 MODULE REQUIRED)
-            endif()
+            find_package(SDL2 REQUIRED)
         endif()
         target_compile_definitions(librw PUBLIC LIBRW_SDL2)
         target_link_libraries(librw
@@ -205,6 +218,68 @@ elseif(LIBRW_PLATFORM_D3D9)
             d3d9
             xinput
     )
+elseif(LIBRW_PLATFORM_VULKAN)
+    # Prefer Android NDK Vulkan if available
+    if(ANDROID)
+        # Android NDK includes Vulkan in the native libraries
+        find_library(VULKAN_NDK_LIBRARY vulkan)
+        if(VULKAN_NDK_LIBRARY)
+            message(STATUS "Using Android NDK Vulkan: ${VULKAN_NDK_LIBRARY}")
+            target_link_libraries(librw
+                PUBLIC
+                    ${VULKAN_NDK_LIBRARY}
+            )
+        else()
+            # Fallback to find_package if NDK vulkan not found
+            find_package(Vulkan CONFIG)
+            if(NOT TARGET Vulkan::Vulkan)
+                find_package(Vulkan MODULE REQUIRED)
+            endif()
+            target_link_libraries(librw
+                PUBLIC
+                    Vulkan::Vulkan
+            )
+        endif()
+    else()
+        find_package(Vulkan CONFIG)
+        if(NOT TARGET Vulkan::Vulkan)
+            find_package(Vulkan MODULE REQUIRED)
+        endif()
+        target_link_libraries(librw
+            PUBLIC
+                Vulkan::Vulkan
+        )
+    endif()
+    target_compile_definitions(librw PUBLIC RW_VULKAN)
+    
+    if(LIBRW_VULKAN_GFXLIB STREQUAL "GLFW")
+        if(NOT TARGET glfw)
+            find_package(glfw3 REQUIRED)
+        endif()
+        target_link_libraries(librw
+            PUBLIC
+                glfw
+        )
+    elseif(LIBRW_VULKAN_GFXLIB STREQUAL "SDL2")
+        if(NOT TARGET SDL2::SDL2)
+            find_package(SDL2 REQUIRED)
+        endif()
+        target_compile_definitions(librw PUBLIC LIBRW_SDL2)
+        target_link_libraries(librw
+            PUBLIC
+                SDL2::SDL2
+        )
+    elseif(LIBRW_VULKAN_GFXLIB STREQUAL "SDL3")
+        find_package(SDL3 CONFIG)
+        if(NOT TARGET SDL3::SDL3)
+            find_package(SDL3 MODULE REQUIRED)
+        endif()
+        target_compile_definitions(librw PUBLIC LIBRW_SDL3)
+        target_link_libraries(librw
+            PUBLIC
+                SDL3::SDL3
+        )
+    endif()
 endif()
 
 if(LIBRW_INSTALL)

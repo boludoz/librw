@@ -46,6 +46,7 @@ Light::create(int32 type)
 	light->color.blue = 1.0f;
 	light->color.alpha = 1.0f;
 	light->minusCosAngle = 1.0f;
+	light->sunLight = 0;
 	light->object.object.privateFlags = 1;
 	light->object.object.flags = LIGHTATOMICS | LIGHTWORLD;
 	light->inWorld.init();

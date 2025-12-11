@@ -1,0 +1,146 @@
+//////////////////////////////////////////////////////////////////////////////
+// This file is part of the Maple Engine                              		//
+//////////////////////////////////////////////////////////////////////////////
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+
+#include "../Common/EdgeStop.glsl"
+#include "../Common/Math.glsl"
+
+#define NUM_THREADS_X 8
+#define NUM_THREADS_Y 8
+
+layout(local_size_x = NUM_THREADS_X, local_size_y = NUM_THREADS_Y, local_size_z = 1) in;
+
+
+layout(set = 0, binding = 0, rg16f) uniform writeonly image2D outColor;
+
+layout(set = 1, binding = 0) uniform sampler2D uNormalSampler;
+layout(set = 1, binding = 1) uniform sampler2D uPBRSampler;
+
+layout(set = 2, binding = 0) uniform sampler2D uInput;
+
+layout(set = 3, binding = 0, std430) buffer DenoiseTileData
+{
+    ivec2 coord[];
+}denoiseTileData;
+
+layout(push_constant) uniform PushConstants
+{
+    int   radius;
+    int   stepSize;
+    float phiVisibility;
+    float phiNormal;
+    float sigmaDepth;
+    float power;
+    float near;
+    float far;
+}pushConstants;
+
+// computes a 3x3 gaussian blur of the variance, centered around
+// the current pixel
+float computeVarianceCenter(ivec2 ipos)
+{
+    float sum = 0.0f;
+
+    const float kernel[2][2] = {
+        { 1.0 / 4.0, 1.0 / 8.0 },
+        { 1.0 / 8.0, 1.0 / 16.0 }
+    };
+
+    const int radius = 1;
+    for (int yy = -radius; yy <= radius; yy++)
+    {
+        for (int xx = -radius; xx <= radius; xx++)
+        {
+            ivec2 p = ipos + ivec2(xx, yy);
+            float k = kernel[abs(xx)][abs(yy)];
+            sum += texelFetch(uInput, p, 0).g * k;
+        }
+    }
+    return sum;
+}
+
+float linearizeDepth(float depth) 
+{
+    float near = pushConstants.near;
+    float far = pushConstants.far;
+    float z = depth * 2.0 - 1.0; // back to NDC 
+    return (2.0 * near * far) / (far + near - z * (far - near));
+}
+
+void main()
+{
+    ivec2       size = textureSize(uNormalSampler, 0);
+    const ivec2 ipos = denoiseTileData.coord[gl_WorkGroupID.x] + ivec2(gl_LocalInvocationID.xy);
+
+    const float epsVariance      = 1e-10;
+    const float kernelWeights[3] = { 1.0, 2.0 / 3.0, 1.0 / 6.0 };
+
+    // constant samplers to prevent the compiler from generating code which
+    // fetches the sampler descriptor from memory for each texture access
+    const vec2 centerVisibility = texelFetch(uInput, ipos, 0).rg;
+
+    // variance for direct and indirect, filtered using 3x3 gaussin blur
+    const float var = computeVarianceCenter(ipos);
+
+    vec4 normal = texelFetch(uNormalSampler, ipos, 0);
+    float centerDepth = texelFetch(uPBRSampler, ipos, 0).b;
+
+    if (centerDepth < 0 || centerDepth >= 1)
+    {
+       imageStore(outColor, ipos, vec4(centerVisibility, 0.0f, 0.0f));
+       return;
+    }
+
+    const float phiVisibility = pushConstants.phiVisibility * sqrt(max(0.0, epsVariance + var.r));
+
+    // explicitly store/accumulate center pixel with weight 1 to prevent issues
+    // with the edge-stopping functions
+    float sumWeightVisibility = 1.0;
+    vec2  sumVisibility   = centerVisibility;
+
+    for (int yy = -pushConstants.radius; yy <= pushConstants.radius; yy++)
+    {
+        for (int xx = -pushConstants.radius; xx <= pushConstants.radius; xx++)
+        {
+            const ivec2 p      = ipos + ivec2(xx, yy) * pushConstants.stepSize;
+            const bool  inside = all(greaterThanEqual(p, ivec2(0, 0))) && all(lessThan(p, size));
+            const float kernel = kernelWeights[abs(xx)] * kernelWeights[abs(yy)];
+
+            if (inside && (xx != 0 || yy != 0)) // skip center pixel, it is already accumulated
+            {
+                const vec2 sampleVisibility = texelFetch(uInput, p, 0).rg;
+
+                vec4 sampleNormal = texelFetch(uNormalSampler, p, 0);
+                float depth = texelFetch(uPBRSampler, p, 0).b;
+
+                // compute the edge-stopping functions
+                const float w = computeEdgeStoppingWeight(centerDepth,
+                                                             depth,
+                                                             pushConstants.sigmaDepth,
+                                                             octohedralToDirection(normal.xy),
+                                                             octohedralToDirection(sampleNormal.xy),
+                                                             pushConstants.phiNormal,
+                                                             centerVisibility.r,
+                                                             sampleVisibility.r,
+                                                             phiVisibility);
+
+                const float wVisibility = w * kernel;
+
+                // alpha channel contains the variance, therefore the weights need to be squared, see paper for the formula
+                sumWeightVisibility += wVisibility;
+                sumVisibility += vec2(wVisibility, wVisibility * wVisibility) * sampleVisibility;
+            }
+        }
+    }
+
+    // renormalization is different for variance, check paper for the formula
+    vec2 outVisibility = sumVisibility / vec2(sumWeightVisibility, sumWeightVisibility * sumWeightVisibility);
+
+    if (pushConstants.power != 0.0f)
+        outVisibility.x = pow(outVisibility.x, pushConstants.power);
+
+    imageStore(outColor, ipos, vec4(outVisibility, 0.0f, 0.0f));
+}

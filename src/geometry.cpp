@@ -868,6 +868,7 @@ Material::create(void)
 	mat->surfaceProps = defaultSurfaceProps;
 	mat->pipeline = nil;
 	mat->refCount = 1;
+	mat->bindlessId = -1;
 	s_plglist.construct(mat);
 	return mat;
 }

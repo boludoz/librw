@@ -33,6 +33,8 @@ int32 build = 0xFFFF;
 	int32 platform = PLATFORM_GL3;
 #elif RW_D3D9
 	int32 platform = PLATFORM_D3D9;
+#elif RW_VULKAN
+	int32 platform = PLATFORM_VULKAN;
 #else
 	int32 platform = PLATFORM_NULL;
 #endif
@@ -184,6 +186,16 @@ V3d::transformVectors(V3d *out, const V3d *in, int32 n, const Matrix *m)
 //
 // RawMatrix
 //
+float 
+RawMatrix::operator[](int32_t idx) const
+{
+	return values[idx];
+}
+float& 
+RawMatrix::operator[](int32_t idx)
+{
+	return values[idx];
+}
 
 void
 RawMatrix::mult(RawMatrix *dst, RawMatrix *src1, RawMatrix *src2)
@@ -205,6 +217,77 @@ RawMatrix::mult(RawMatrix *dst, RawMatrix *src1, RawMatrix *src2)
 	dst->pos.z   = src1->pos.x*src2->right.z   + src1->pos.y*src2->up.z   + src1->pos.z*src2->at.z + src1->posw*src2->pos.z;
 	dst->posw    = src1->pos.x*src2->rightw    + src1->pos.y*src2->upw    + src1->pos.z*src2->atw  + src1->posw*src2->posw;
 }
+
+void 
+RawMatrix::invert(RawMatrix* dst, RawMatrix* src_)
+{
+	RawMatrix src;
+
+	transpose(&src, src_);
+
+	RawMatrix& m16 = *dst;
+
+	float tmp[12]; // temp array for pairs
+	tmp[0] = src[10] * src[15];
+	tmp[1] = src[11] * src[14];
+	tmp[2] = src[9] * src[15];
+	tmp[3] = src[11] * src[13];
+	tmp[4] = src[9] * src[14];
+	tmp[5] = src[10] * src[13];
+	tmp[6] = src[8] * src[15];
+	tmp[7] = src[11] * src[12];
+	tmp[8] = src[8] * src[14];
+	tmp[9] = src[10] * src[12];
+	tmp[10] = src[8] * src[13];
+	tmp[11] = src[9] * src[12];
+
+	// calculate first 8 elements (cofactors)
+	m16[0] = (tmp[0] * src[5] + tmp[3] * src[6] + tmp[4] * src[7]) - (tmp[1] * src[5] + tmp[2] * src[6] + tmp[5] * src[7]);
+	m16[1] = (tmp[1] * src[4] + tmp[6] * src[6] + tmp[9] * src[7]) - (tmp[0] * src[4] + tmp[7] * src[6] + tmp[8] * src[7]);
+	m16[2] = (tmp[2] * src[4] + tmp[7] * src[5] + tmp[10] * src[7]) - (tmp[3] * src[4] + tmp[6] * src[5] + tmp[11] * src[7]);
+	m16[3] = (tmp[5] * src[4] + tmp[8] * src[5] + tmp[11] * src[6]) - (tmp[4] * src[4] + tmp[9] * src[5] + tmp[10] * src[6]);
+	m16[4] = (tmp[1] * src[1] + tmp[2] * src[2] + tmp[5] * src[3]) - (tmp[0] * src[1] + tmp[3] * src[2] + tmp[4] * src[3]);
+	m16[5] = (tmp[0] * src[0] + tmp[7] * src[2] + tmp[8] * src[3]) - (tmp[1] * src[0] + tmp[6] * src[2] + tmp[9] * src[3]);
+	m16[6] = (tmp[3] * src[0] + tmp[6] * src[1] + tmp[11] * src[3]) - (tmp[2] * src[0] + tmp[7] * src[1] + tmp[10] * src[3]);
+	m16[7] = (tmp[4] * src[0] + tmp[9] * src[1] + tmp[10] * src[2]) - (tmp[5] * src[0] + tmp[8] * src[1] + tmp[11] * src[2]);
+
+	// calculate pairs for second 8 elements (cofactors)
+	tmp[0] = src[2] * src[7];
+	tmp[1] = src[3] * src[6];
+	tmp[2] = src[1] * src[7];
+	tmp[3] = src[3] * src[5];
+	tmp[4] = src[1] * src[6];
+	tmp[5] = src[2] * src[5];
+	tmp[6] = src[0] * src[7];
+	tmp[7] = src[3] * src[4];
+	tmp[8] = src[0] * src[6];
+	tmp[9] = src[2] * src[4];
+	tmp[10] = src[0] * src[5];
+	tmp[11] = src[1] * src[4];
+
+	// calculate second 8 elements (cofactors)
+	m16[8] = (tmp[0] * src[13] + tmp[3] * src[14] + tmp[4] * src[15]) - (tmp[1] * src[13] + tmp[2] * src[14] + tmp[5] * src[15]);
+	m16[9] = (tmp[1] * src[12] + tmp[6] * src[14] + tmp[9] * src[15]) - (tmp[0] * src[12] + tmp[7] * src[14] + tmp[8] * src[15]);
+	m16[10] = (tmp[2] * src[12] + tmp[7] * src[13] + tmp[10] * src[15]) - (tmp[3] * src[12] + tmp[6] * src[13] + tmp[11] * src[15]);
+	m16[11] = (tmp[5] * src[12] + tmp[8] * src[13] + tmp[11] * src[14]) - (tmp[4] * src[12] + tmp[9] * src[13] + tmp[10] * src[14]);
+	m16[12] = (tmp[2] * src[10] + tmp[5] * src[11] + tmp[1] * src[9]) - (tmp[4] * src[11] + tmp[0] * src[9] + tmp[3] * src[10]);
+	m16[13] = (tmp[8] * src[11] + tmp[0] * src[8] + tmp[7] * src[10]) - (tmp[6] * src[10] + tmp[9] * src[11] + tmp[1] * src[8]);
+	m16[14] = (tmp[6] * src[9] + tmp[11] * src[11] + tmp[3] * src[8]) - (tmp[10] * src[11] + tmp[2] * src[8] + tmp[7] * src[9]);
+	m16[15] = (tmp[10] * src[10] + tmp[4] * src[8] + tmp[9] * src[9]) - (tmp[8] * src[9] + tmp[11] * src[10] + tmp[5] * src[8]);
+
+	float det = 0;
+
+	// calculate determinant
+	det = src[0] * m16[0] + src[1] * m16[1] + src[2] * m16[2] + src[3] * m16[3];
+
+	// calculate matrix inverse
+	float invdet = 1 / det;
+	for (int j = 0; j < 16; ++j)
+	{
+		m16[j] *= invdet;
+	}
+}
+
 
 void
 RawMatrix::transpose(RawMatrix *dst, RawMatrix *src)
@@ -231,10 +314,10 @@ void
 RawMatrix::setIdentity(RawMatrix *dst)
 {
 	static RawMatrix identity = {
-		{ 1.0f, 0.0f, 0.0f }, 0.0f,
-		{ 0.0f, 1.0f, 0.0f }, 0.0f,
-		{ 0.0f, 0.0f, 1.0f }, 0.0f,
-		{ 0.0f, 0.0f, 0.0f }, 1.0f
+		1.0f, 0.0f, 0.0f , 0.0f,
+		0.0f, 1.0f, 0.0f , 0.0f,
+		0.0f, 0.0f, 1.0f , 0.0f,
+		0.0f, 0.0f, 0.0f , 1.0f
 	};
 	*dst = identity;
 }

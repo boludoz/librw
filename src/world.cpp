@@ -57,6 +57,13 @@ World::addLight(Light *light)
 	}
 }
 
+void 
+World::removeLights()
+{
+	this->globalLights.init();
+	this->localLights.init();
+}
+
 void
 World::removeLight(Light *light)
 {
@@ -221,7 +228,7 @@ World::enumerateLights(WorldLights *lightData)
 			lightData->ambient.blue  += l->color.blue;
 			lightData->numAmbients++;
 		}else if(l->getType() == Light::DIRECTIONAL){
-			if(lightData->numDirectionals < maxDirectionals)
+			if (lightData->numDirectionals < maxDirectionals)
 				lightData->directionals[lightData->numDirectionals++] = l;
 		}
 	}

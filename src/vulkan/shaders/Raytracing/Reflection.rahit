@@ -1,0 +1,52 @@
+//////////////////////////////////////////////////////////////////////////////
+// This file is part of the Maple Engine                              		//
+//////////////////////////////////////////////////////////////////////////////
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_ray_query : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+
+#include "Common.glsl"
+#include "../Common/Common.glsl"
+#include "../Common/Math.glsl"
+
+
+////////////////////////Scene Infos////////////////////////////////
+layout (set = 0, binding = 0, std430) buffer ObjectBuffer 
+{
+	Object objects[];
+};
+
+layout (set = 0, binding = 1) uniform accelerationStructureEXT uTopLevelAS;
+/////////////////////////////////////////////////////////////////
+
+
+layout (set = 1, binding = 0, scalar) readonly buffer VertexBuffer 
+{
+    Vertex data[];
+} Vertices[];
+
+layout (set = 2, binding = 0, scalar) readonly buffer IndexBuffer 
+{
+    int16_t data[];
+} Indices[];
+
+///////////////////////////////////////////////////////////////
+layout (set = 3, binding = 0) uniform sampler2D uSamplers[];
+
+///////////////////////////////////////////////////////////////
+
+#include "../Common/Bindless.glsl"
+
+hitAttributeEXT vec2 hitAttribs;
+
+void main()
+{
+    SurfaceMaterial surface = getSurface(gl_InstanceCustomIndexEXT, gl_GeometryIndexEXT, gl_PrimitiveID, hitAttribs);
+    if (surface.diffuse.a < 0.1f)
+        ignoreIntersectionEXT;
+}

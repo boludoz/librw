@@ -81,23 +81,41 @@ instV4d(int type, uint8 *dst, V4d *src, uint32 numVertices, uint32 stride)
 void
 instV3d(int type, uint8 *dst, V3d *src, uint32 numVertices, uint32 stride)
 {
-	if(type == VERT_FLOAT3)
-		for(uint32 i = 0; i < numVertices; i++){
-			memcpy(dst, src, 12);
-			dst += stride;
-			src++;
+	if(src == nullptr)
+	{
+		if(type == VERT_FLOAT3) 
+		{
+			V3d defaultValue = {0,0,0};
+			for(uint32 i = 0; i < numVertices; i++) {
+				memcpy(dst, &defaultValue, 12);
+				dst += stride;
+				src++;
+			}
 		}
-	else if(type == VERT_COMPNORM)
-		for(uint32 i = 0; i < numVertices; i++){
-			uint32 n = ((((uint32)(src->z *  511.0f)) & 0x3ff) << 22) |
-				   ((((uint32)(src->y * 1023.0f)) & 0x7ff) << 11) |
-				   ((((uint32)(src->x * 1023.0f)) & 0x7ff) <<  0);
-			*(uint32*)dst = n;
-			dst += stride;
-			src++;
+		else if(type == VERT_COMPNORM)
+		{
+			assert(0 && "unsupported VERT_COMPNORM type");
 		}
-	else
-		assert(0 && "unsupported instV3d type");
+	} 
+	else 
+	{
+		if(type == VERT_FLOAT3)
+			for(uint32 i = 0; i < numVertices; i++) {
+				memcpy(dst, src, 12);
+				dst += stride;
+				src++;
+			}
+		else if(type == VERT_COMPNORM)
+			for(uint32 i = 0; i < numVertices; i++) {
+				uint32 n = ((((uint32)(src->z * 511.0f)) & 0x3ff) << 22) | ((((uint32)(src->y * 1023.0f)) & 0x7ff) << 11) |
+					   ((((uint32)(src->x * 1023.0f)) & 0x7ff) << 0);
+				*(uint32 *)dst = n;
+				dst += stride;
+				src++;
+			}
+		else
+			assert(0 && "unsupported instV3d type");
+	}
 }
 
 void
@@ -135,9 +153,18 @@ instTexCoords(int type, uint8 *dst, TexCoords *src, uint32 numVertices, uint32 s
 {
 	assert(type == VERT_FLOAT2);
 	for(uint32 i = 0; i < numVertices; i++){
-		memcpy(dst, src, 8);
-		dst += stride;
-		src++;
+		if (src != nullptr) 
+		{
+			memcpy(dst, src, 8);
+			dst += stride;
+			src++;
+		}
+		else 
+		{
+			TexCoords newSrc = {0.f,1.f};
+			memcpy(dst, &newSrc, 8);
+			dst += stride;
+		}
 	}
 }
 
@@ -180,6 +207,61 @@ instColor(int type, uint8 *dst, RGBA *src, uint32 numVertices, uint32 stride)
 		assert(0 && "unsupported color type");
 	return alpha != 0xFF;
 }
+
+bool32
+instFloatColor(int type, uint8* dst, RGBA* src, uint32 numVertices, uint32 stride, bool normalized)
+{
+	uint8 alpha = 0xFF;
+	if (type == VERT_ARGB)
+	{
+		for (uint32 i = 0; i < numVertices; i++) {
+			float* floatDst = reinterpret_cast<float*>(dst);
+			floatDst[0] = src == nullptr ? 0.f : normalized ? src->blue / 255.f : src->blue;
+			floatDst[1] = src == nullptr ? 0.f : normalized ? src->green / 255.f : src->green;
+			floatDst[2] = src == nullptr ? 0.f : normalized ? src->red / 255.f : src->red;
+			floatDst[3] = src == nullptr ? 1.f : normalized ? src->alpha / 255.f : src->alpha;
+
+			alpha &= src == nullptr ? 0xFF : src->alpha;
+			dst += stride;
+			if (src != nullptr)
+				src++;
+		}
+	}
+	else if (type == VERT_RGBA)
+	{
+		for (uint32 i = 0; i < numVertices; i++) {
+			float* floatDst = reinterpret_cast<float*>(dst);
+			floatDst[0] = src == nullptr ? 0.f : normalized ? src->red / 255.f : src->red;
+			floatDst[1] = src == nullptr ? 0.f : normalized ? src->green / 255.f : src->green;
+			floatDst[2] = src == nullptr ? 0.f : normalized ? src->blue / 255.f : src->blue;
+			floatDst[3] = src == nullptr ? 1.f : normalized ? src->alpha / 255.f : src->alpha;
+			alpha &= src == nullptr ? 0xFF : src->alpha;
+			dst += stride;
+
+			if (src != nullptr)
+				src++;
+		}
+	}
+	else if (type == VERT_BARG)
+	{
+		for (uint32 i = 0; i < numVertices; i++) {
+			float* floatDst = reinterpret_cast<float*>(dst);
+			floatDst[0] = src == nullptr ? 0.f : normalized ? src->blue / 255.f : src->blue;
+			floatDst[1] = src == nullptr ? 0.f : normalized ? src->alpha / 255.f : src->alpha;
+			floatDst[2] = src == nullptr ? 0.f : normalized ? src->red / 255.f : src->red;
+			floatDst[3] = src == nullptr ? 1.f : normalized ? src->green / 255.f : src->green;
+			alpha &= src == nullptr ? 0xFF : src->alpha;
+			dst += stride;
+
+			if (src != nullptr)
+				src++;
+		}
+	}
+	else
+		assert(0 && "unsupported color type");
+	return alpha != 0xFF;
+}
+
 
 void
 uninstColor(int type, RGBA *dst, uint8 *src, uint32 numVertices, uint32 stride)

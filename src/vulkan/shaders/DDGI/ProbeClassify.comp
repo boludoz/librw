@@ -1,0 +1,133 @@
+//////////////////////////////////////////////////////////////////////////////
+// This file is part of the Maple Engine                              		//
+//////////////////////////////////////////////////////////////////////////////
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#include "DDGICommon.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D iDirectionDistance;
+
+layout(set = 0, binding = 1, scalar) buffer ProbeState
+{
+    int8_t probeStates[];
+};//we can also use bit to do so.. later..
+
+layout(set = 0, binding = 2, scalar)  uniform DDGIUBO
+{
+    DDGIUniform ddgi; 
+};
+
+
+layout(push_constant) uniform PushConstants
+{
+    vec4 planes[6];
+    float threshold;
+}pushConsts;
+
+bool intersects(vec3 center, float radius)
+{
+    uint infrustum = 1;
+    infrustum &= uint(dot(pushConsts.planes[0], vec4(center, 1)) > -radius);
+    infrustum &= uint(dot(pushConsts.planes[1], vec4(center, 1)) > -radius);
+    infrustum &= uint(dot(pushConsts.planes[2], vec4(center, 1)) > -radius);
+    infrustum &= uint(dot(pushConsts.planes[3], vec4(center, 1)) > -radius);
+    infrustum &= uint(dot(pushConsts.planes[4], vec4(center, 1)) > -radius);
+    infrustum &= uint(dot(pushConsts.planes[5], vec4(center, 1)) > -radius);
+    return infrustum != 0;
+}
+
+void main()
+{
+    int probeIndex = int(gl_GlobalInvocationID.x);
+    int numProbes = (ddgi.probeCounts.x * ddgi.probeCounts.y * ddgi.probeCounts.z);
+    
+    if(probeIndex >= numProbes)
+        return;
+
+    vec3 probeWorldPosition = probeLocation(ddgi, probeIndex);
+
+    //TODO...
+    //if(!intersects(probeWorldPosition, ddgi.maxDistance))
+   // {
+      // probeStates[probeIndex] = int8_t(DDGI_PROBE_STATE_OUTOF_CAMERA);
+      // return;
+   // }
+
+    const bool inactive = probeStates[probeIndex] == DDGI_PROBE_STATE_INACTIVE;
+
+    int numRays = inactive ? int(ddgi.raysPerProbe * 0.5) : ddgi.raysPerProbe;
+    // min(ddgi.raysPerProbe, DDGI_NUM_FIXED_RAYS);
+    int rayIndex;
+    int backfaceCount = 0;
+    float hitDistances[DDGI_NUM_FIXED_RAYS];
+
+    for (rayIndex = 0; rayIndex < numRays; rayIndex++)
+    {
+        // Load the hit distance for the ray
+        hitDistances[rayIndex] = imageLoad(iDirectionDistance, ivec2(rayIndex, probeIndex)).a;
+        // Increment the count if a backface is hit
+        backfaceCount += int(hitDistances[rayIndex] < 0.f);
+    }
+
+    float percent = backfaceCount / float(numRays);
+    if(percent > pushConsts.threshold)
+    {
+        probeStates[probeIndex] = int8_t(DDGI_PROBE_STATE_INACTIVE);
+        return;
+    }
+
+
+
+
+    // Determine if there is nearby geometry in the probe's voxel.
+    // Iterate over the probe rays and compare ray hit distances with
+    // the distance(s) to the probe's voxel planes.
+    for (rayIndex = 0; rayIndex < DDGI_NUM_FIXED_RAYS; rayIndex++)
+    {
+        // Skip backface hits
+        if(hitDistances[rayIndex] < 0) continue;
+
+        // Get the direction of the "fixed" ray
+        vec3 direction = imageLoad(iDirectionDistance, ivec2(rayIndex, probeIndex)).rgb;
+
+        // Get the plane normals
+        vec3 xNormal = vec3(direction.x / max(abs(direction.x), 0.000001f), 0.f, 0.f);
+        vec3 yNormal = vec3(0.f, direction.y / max(abs(direction.y), 0.000001f), 0.f);
+        vec3 zNormal = vec3(0.f, 0.f, direction.z / max(abs(direction.z), 0.000001f));
+
+        // Get the relevant planes to intersect
+        vec3 p0x = probeWorldPosition + (ddgi.step.x * xNormal);
+        vec3 p0y = probeWorldPosition + (ddgi.step.y * yNormal);
+        vec3 p0z = probeWorldPosition + (ddgi.step.z * zNormal);
+
+        // Get the ray's intersection distance with each plane
+        vec3 distances = 
+        {
+            dot((p0x - probeWorldPosition), xNormal) / max(dot(direction, xNormal), 0.000001f),
+            dot((p0y - probeWorldPosition), yNormal) / max(dot(direction, yNormal), 0.000001f),
+            dot((p0z - probeWorldPosition), zNormal) / max(dot(direction, zNormal), 0.000001f)
+        };
+
+        // If the ray is parallel to the plane, it will never intersect
+        // Set the distance to a very large number for those planes
+        if (distances.x == 0.f) distances.x = 1e27f;
+        if (distances.y == 0.f) distances.y = 1e27f;
+        if (distances.z == 0.f) distances.z = 1e27f;
+
+        // Get the distance to the closest plane intersection
+        float maxDistance = min(distances.x, min(distances.y, distances.z));
+
+        // If the hit distance is less than the closest plane intersection, the probe should be active
+        if(hitDistances[rayIndex] <= maxDistance)
+        {
+            probeStates[probeIndex] = int8_t(DDGI_PROBE_STATE_ACTIVE);
+            return;
+        }
+    }
+    probeStates[probeIndex] = int8_t(DDGI_PROBE_STATE_INACTIVE);
+}

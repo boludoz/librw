@@ -17,6 +17,7 @@
 #include "d3d/rwd3d9.h"
 #include "d3d/rwd3dimpl.h"
 #include "gl/rwgl3.h"
+#include "vulkan/rwvk.h"
 
 #define PLUGIN_ID 0
 
@@ -469,20 +470,27 @@ Texture::streamReadNative(Stream *stream)
 		RWERROR((ERR_CHUNK, "STRUCT"));
 		return nil;
 	}
+	Texture *ret = nullptr;
+
 	uint32 platform = stream->readU32();
 	stream->seek(-16);
 	if(platform == FOURCC_PS2)
-		return ps2::readNativeTexture(stream);
+		ret = ps2::readNativeTexture(stream);
 	if(platform == PLATFORM_D3D8)
-		return d3d8::readNativeTexture(stream);
+		ret = d3d8::readNativeTexture(stream);
 	if(platform == PLATFORM_D3D9)
-		return d3d9::readNativeTexture(stream);
+		ret = d3d9::readNativeTexture(stream);
 	if(platform == PLATFORM_XBOX)
-		return xbox::readNativeTexture(stream);
+		ret = xbox::readNativeTexture(stream);
 	if(platform == PLATFORM_GL3)
-		return gl3::readNativeTexture(stream);
-	assert(0 && "unsupported platform");
-	return nil;
+		ret = gl3::readNativeTexture(stream);
+	if(platform == PLATFORM_VULKAN)
+		ret = vulkan::readNativeTexture(stream);
+
+	assert(ret != nullptr);
+
+	//assert(0 && "unsupported platform");
+	return ret;
 }
 
 void
@@ -498,6 +506,8 @@ Texture::streamWriteNative(Stream *stream)
 		xbox::writeNativeTexture(this, stream);
 	else if(this->raster->platform == PLATFORM_GL3)
 		gl3::writeNativeTexture(this, stream);
+	else if(this->raster->platform == PLATFORM_VULKAN)
+		vulkan::writeNativeTexture(this, stream);
 	else
 		assert(0 && "unsupported platform");
 }
@@ -515,6 +525,8 @@ Texture::streamGetSizeNative(void)
 		return xbox::getSizeNativeTexture(this);
 	if(this->raster->platform == PLATFORM_GL3)
 		return gl3::getSizeNativeTexture(this);
+	if(this->raster->platform == PLATFORM_VULKAN)
+		return vulkan::getSizeNativeTexture(this);
 	assert(0 && "unsupported platform");
 	return 0;
 }

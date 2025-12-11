@@ -17,6 +17,7 @@
 #include "d3d/rwd3d9.h"
 #include "gl/rwgl3.h"
 #include "gl/rwwdgl.h"
+#include "vulkan/rwvk.h"
 
 #define PLUGIN_ID 0
 
@@ -236,6 +237,7 @@ Engine::init(MemoryFunctions *memfuncs)
 	d3d9::registerPlatformPlugins();
 	wdgl::registerPlatformPlugins();
 	gl3::registerPlatformPlugins();
+	vulkan::registerPlatformPlugins();
 
 	Engine::state = Initialized;
 	return 1;
@@ -270,6 +272,8 @@ Engine::open(EngineOpenParams *p)
 	engine->device = gl3::renderdevice;
 #elif RW_D3D9
 	engine->device = d3d::renderdevice;
+#elif RW_VULKAN
+	engine->device = vulkan::renderdevice;
 #else
 	engine->device = null::renderdevice;
 #endif

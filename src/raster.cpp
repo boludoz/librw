@@ -15,6 +15,7 @@
 //#include "d3d/rwd3d8.h"
 //#include "d3d/rwd3d9.h"
 #include "gl/rwgl3.h"
+#include "vulkan/rwvk.h"
 
 #define PLUGIN_ID 0
 
@@ -74,6 +75,7 @@ Raster::create(int32 width, int32 height, int32 depth, int32 format, int32 platf
 	raster->depth = depth;
 	raster->stride = 0;
 	raster->pixels = raster->palette = nil;
+	memset(raster->name, 0, 32 * sizeof(char));
 	s_plglist.construct(raster);
 
 //	printf("%d %d %d %d\n", raster->type, raster->width, raster->height, raster->depth);
@@ -190,6 +192,11 @@ Raster::show(uint32 flags)
 	engine->device.showRaster(this, flags);
 }
 
+void Raster::setTextureName(const char *name) 
+{
+	engine->driver[this->platform]->rasterSetTextureName(this,name);
+}
+
 Raster*
 Raster::pushContext(Raster *raster)
 {
@@ -248,6 +255,24 @@ conv_RGBA8888_from_RGB888(uint8 *out, uint8 *in)
 	out[1] = in[1];
 	out[2] = in[2];
 	out[3] = 0xFF;
+}
+
+void 
+conv_RGBA8888Transparency_from_RGB888(uint8 *out, uint8 *in)
+{
+	out[0] = in[0];
+	out[1] = in[1];
+	out[2] = in[2];
+	out[3] = in[0] == in[1] && in[1] == in[2] && in[2] == 0 ? 0 : 0xFF;
+}
+
+void 
+conv_RGBA8888Transparency_from_RGBA8888(uint8 *out, uint8 *in)
+{
+	out[0] = in[0];
+	out[1] = in[1];
+	out[2] = in[2];
+	out[3] = in[0] == in[1] && in[1] == in[2] && in[2] == 0 ? in[0] : in[3];
 }
 
 void
@@ -460,6 +485,73 @@ d3d_to_gl3(rw::Raster *ras)
 #endif
 }
 
+static rw::Raster *d3d_to_vk(rw::Raster *ras)
+{
+#ifdef RW_VULKAN
+	using namespace rw;
+
+	if(!gl3::gl3Caps.dxtSupported) return nil;
+
+	int dxt = 0;
+	d3d::D3dRaster *d3dras = GETD3DRASTEREXT(ras);
+	if(d3dras->customFormat) {
+		switch(d3dras->format) {
+		case d3d::D3DFMT_DXT1: dxt = 1; break;
+		case d3d::D3DFMT_DXT3: dxt = 3; break;
+		case d3d::D3DFMT_DXT5: dxt = 5; break;
+		}
+	}
+	if(dxt == 0) return nil;
+
+	Raster *newras = Raster::create(ras->width, ras->height, ras->depth, ras->format | Raster::TEXTURE | Raster::DONTALLOCATE);
+	int numLevels = ras->getNumLevels();
+	vulkan::allocateDXT(newras, dxt, numLevels, d3dras->hasAlpha);
+	for(int i = 0; i < numLevels; i++) {
+		uint8 *srcpx = ras->lock(i, Raster::LOCKREAD);
+		uint8 *dstpx = newras->lock(i, Raster::LOCKWRITE | Raster::LOCKNOFETCH);
+		flipDXT(dxt, dstpx, srcpx, ras->width, ras->height);
+		ras->unlock(i);
+		newras->unlock(i);
+	}
+
+	return newras;
+#else
+	return nil;
+#endif
+}
+
+static rw::Raster *xbox_to_vk(rw::Raster *ras)
+{
+#ifdef RW_VULKAN
+	using namespace rw;
+
+	int dxt = 0;
+	xbox::XboxRaster *xboxras = GETXBOXRASTEREXT(ras);
+	if(xboxras->customFormat) {
+		switch(xboxras->format) {
+		case xbox::D3DFMT_DXT1: dxt = 1; break;
+		case xbox::D3DFMT_DXT3: dxt = 3; break;
+		case xbox::D3DFMT_DXT5: dxt = 5; break;
+		}
+	}
+	if(dxt == 0) return nil;
+
+	Raster *newras = Raster::create(ras->width, ras->height, ras->depth, ras->format | Raster::TEXTURE | Raster::DONTALLOCATE);
+	int numLevels = ras->getNumLevels();
+	vulkan::allocateDXT(newras, dxt, numLevels, xboxras->hasAlpha);
+	for(int i = 0; i < numLevels; i++) {
+		uint8 *srcpx = ras->lock(i, Raster::LOCKREAD);
+		uint8 *dstpx = newras->lock(i, Raster::LOCKWRITE | Raster::LOCKNOFETCH);
+		flipDXT(dxt, dstpx, srcpx, ras->width, ras->height);
+		ras->unlock(i);
+		newras->unlock(i);
+	}
+
+	return newras;
+#else
+	return nil;
+#endif
+}
 static rw::Raster*
 xbox_to_gl3(rw::Raster *ras)
 {
@@ -503,30 +595,63 @@ Raster::convertTexToCurrentPlatform(rw::Raster *ras)
 
 	if(ras->platform == rw::platform)
 		return ras;
-	// compatible platforms
-	if((ras->platform == PLATFORM_D3D8 && rw::platform == PLATFORM_D3D9) ||
-	   (ras->platform == PLATFORM_D3D9 && rw::platform == PLATFORM_D3D8))
-		return ras;
 
-	// special cased conversion for DXT
-	if((ras->platform == PLATFORM_D3D8 || ras->platform == PLATFORM_D3D9) && rw::platform == PLATFORM_GL3){
-		Raster *newras = d3d_to_gl3(ras);
-		if(newras){
-			ras->destroy();
-			return newras;
+	// Special cased conversion for DXT
+	Raster *newras = nil;
+	
+	switch(rw::platform) {
+#ifdef RW_GL3
+	case PLATFORM_GL3:
+		switch(ras->platform) {
+		case PLATFORM_D3D8:
+		case PLATFORM_D3D9:
+			newras = d3d_to_gl3(ras);
+			break;
+		case PLATFORM_XBOX:
+			newras = xbox_to_gl3(ras);
+			break;
 		}
-	}else if(ras->platform == PLATFORM_XBOX && (rw::platform == PLATFORM_D3D9 || rw::platform == PLATFORM_D3D8)){
-		Raster *newras = xbox_to_d3d(ras);
-		if(newras){
-			ras->destroy();
-			return newras;
+		break;
+#endif
+
+#ifdef RW_VULKAN
+	case PLATFORM_VULKAN:
+		switch(ras->platform) {
+		case PLATFORM_D3D8:
+		case PLATFORM_D3D9:
+			newras = d3d_to_vk(ras);
+			break;
+		case PLATFORM_XBOX:
+			newras = xbox_to_vk(ras);
+			break;
 		}
-	}else if(ras->platform == PLATFORM_XBOX && rw::platform == PLATFORM_GL3){
-		Raster *newras = xbox_to_gl3(ras);
-		if(newras){
-			ras->destroy();
-			return newras;
+		break;
+#endif
+
+	case PLATFORM_D3D8:
+		switch(ras->platform) {
+		case PLATFORM_D3D9:
+			return ras;  // Compatible platforms
+		case PLATFORM_XBOX:
+			newras = xbox_to_d3d(ras);
+			break;
 		}
+		break;
+
+	case PLATFORM_D3D9:
+		switch(ras->platform) {
+		case PLATFORM_D3D8:
+			return ras;  // Compatible platforms
+		case PLATFORM_XBOX:
+			newras = xbox_to_d3d(ras);
+			break;
+		}
+		break;
+	}
+	
+	if(newras) {
+		ras->destroy();
+		return newras;
 	}
 
 	// fall back to going through Image directly
@@ -536,7 +661,9 @@ Raster::convertTexToCurrentPlatform(rw::Raster *ras)
 	img->unpalettize();
 	Raster::imageFindRasterFormat(img, Raster::TEXTURE, &width, &height, &depth, &format);
 	format |= ras->format & (Raster::MIPMAP | Raster::AUTOMIPMAP);
-	Raster *newras = Raster::create(width, height, depth, format);
+	newras = Raster::create(width, height, depth, format);
+	assert(newras != nullptr);
+	//newras->setTextureName(ras->name);
 	newras->setFromImage(img);
 	img->destroy();
 	int numLevels = ras->getNumLevels();

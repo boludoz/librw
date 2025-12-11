@@ -65,7 +65,6 @@ struct Device
 	void (*im3DRenderPrimitive)(PrimitiveType primType);
 	void (*im3DRenderIndexedPrimitive)(PrimitiveType primType, void *indices, int32 numIndices);
 	void (*im3DEnd)(void);
-
 	DeviceSystem *system;
 };
 
@@ -76,7 +75,9 @@ struct Driver
 	ObjPipeline *defaultPipeline;
 	int32 rasterNativeOffset;
 
-	Raster* (*rasterCreate)(Raster*);
+	Raster *(*rasterCreate)(Raster *);
+	void (*rasterSetTextureName)(Raster *, const char * name);
+
 	uint8 *(*rasterLock)(Raster*, int32 level, int32 lockMode);
 	void   (*rasterUnlock)(Raster*, int32 level);
 	uint8 *(*rasterLockPalette)(Raster*, int32 lockMode);

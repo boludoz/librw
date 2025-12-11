@@ -28,12 +28,14 @@ public:
 	struct {
 		void (*instance)(ObjPipeline *pipe, Atomic *atomic);
 		void (*uninstance)(ObjPipeline *pipe, Atomic *atomic);
-		void (*render)(ObjPipeline *pipe, Atomic *atomic);
+		void (*render)(ObjPipeline* pipe, Atomic* atomic);
+		void (*beginUpdate)(ObjPipeline* pipe, Atomic* atomic);
 	} impl;
 	// just for convenience
 	void instance(Atomic *atomic) { this->impl.instance(this, atomic); }
 	void uninstance(Atomic *atomic) { this->impl.uninstance(this, atomic); }
 	void render(Atomic *atomic) { this->impl.render(this, atomic); }
+	void beginUpdate(Atomic* atomic) { this->impl.beginUpdate(this, atomic); }
 };
 
 void findMinVertAndNumVertices(uint16 *indices, uint32 numIndices, uint32 *minVert, int32 *numVertices);
@@ -51,6 +53,7 @@ enum {
 	VERT_FLOAT4,
 	VERT_ARGB,
 	VERT_RGBA,
+	VERT_BARG,
 	VERT_COMPNORM
 };
 
@@ -59,7 +62,8 @@ void instV3d(int type, uint8 *dst, V3d *src, uint32 numVertices, uint32 stride);
 void uninstV3d(int type, V3d *dst, uint8 *src, uint32 numVertices, uint32 stride);
 void instTexCoords(int type, uint8 *dst, TexCoords *src, uint32 numVertices, uint32 stride);
 void uninstTexCoords(int type, TexCoords *dst, uint8 *src, uint32 numVertices, uint32 stride);
-bool32 instColor(int type, uint8 *dst, RGBA *src, uint32 numVertices, uint32 stride);
+bool32 instColor(int type, uint8* dst, RGBA* src, uint32 numVertices, uint32 stride);
+bool32 instFloatColor(int type, uint8* dst, RGBA* src, uint32 numVertices, uint32 stride, bool normalized = true);
 void uninstColor(int type, RGBA *dst, uint8 *src, uint32 numVertices, uint32 stride);
 
 }

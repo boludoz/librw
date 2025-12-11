@@ -37,7 +37,9 @@ enum RenderState
 	// emulation of PS2 GS alpha test
 	//  in the mode where it still writes color but nor depth
 	GSALPHATEST,
-	GSALPHATESTREF
+	GSALPHATESTREF,
+	SKYBOX_FACE,
+	RAIN_INTENSITY
 };
 
 enum AlphaTestFunc
@@ -93,6 +95,8 @@ enum BlendFunction
 	BLENDSRCALPHASAT
 	// TODO: add more perhaps
 };
+
+void showSystemMouse(bool show);
 
 void SetRenderState(int32 state, uint32 value);
 void SetRenderStatePtr(int32 state, void *value);
