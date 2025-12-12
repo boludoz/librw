@@ -25,7 +25,6 @@ namespace gl3 {
 GlGlobals glGlobals;
 
 Gl3Caps gl3Caps;
-// terrible hack for GLES
 bool32 needToReadBackTextures;
 
 int32   alphaFunc;
@@ -1439,7 +1438,9 @@ beginUpdate(Camera *cam)
 	setFrameBuffer(cam);
 
 	if(gl3Caps.gles) {
-		glDepthMask(GL_TRUE);
+		// glDisable(GL_DEPTH_TEST);
+		glDepthMask(GL_FALSE);
+		glDisable(GL_STENCIL_TEST);
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 		glDepthMask(rwStateCache.zwrite);
 	}
