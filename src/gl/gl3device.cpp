@@ -31,7 +31,79 @@ bool32 needToReadBackTextures;
 int32   alphaFunc;
 float32 alphaRef;
 
-bool isAdreno = false;
+// Helper function to log OpenGL info using SDL logging and optionally to file
+static void
+logGLInfo(void)
+{
+	const char *version     = (const char *)glGetString(GL_VERSION);
+	const char *vendor      = (const char *)glGetString(GL_VENDOR);
+	const char *renderer    = (const char *)glGetString(GL_RENDERER);
+	const char *extensions  = (const char *)glGetString(GL_EXTENSIONS);
+	const char *shadingLang = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
+
+	GLint maxVertexAttribs, maxVertexUniforms, maxFragmentUniforms, maxTextureSize;
+	glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &maxVertexAttribs);
+	glGetIntegerv(GL_MAX_VERTEX_UNIFORM_VECTORS, &maxVertexUniforms);
+	glGetIntegerv(GL_MAX_FRAGMENT_UNIFORM_VECTORS, &maxFragmentUniforms);
+	glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+
+	// Always log to SDL_Log (shows in logcat on Android)
+	SDL_Log("== OpenGL Info ==");
+	SDL_Log("GL_VERSION: %s", version ? version : "N/A");
+	SDL_Log("GL_VENDOR: %s", vendor ? vendor : "N/A");
+	SDL_Log("GL_RENDERER: %s", renderer ? renderer : "N/A");
+	SDL_Log("GL_SHADING_LANGUAGE_VERSION: %s", shadingLang ? shadingLang : "N/A");
+	SDL_Log("GL_MAX_VERTEX_ATTRIBS: %d", maxVertexAttribs);
+	SDL_Log("GL_MAX_VERTEX_UNIFORM_VECTORS: %d", maxVertexUniforms);
+	SDL_Log("GL_MAX_FRAGMENT_UNIFORM_VECTORS: %d", maxFragmentUniforms);
+	SDL_Log("GL_MAX_TEXTURE_SIZE: %d", maxTextureSize);
+
+	// Try to also write to file in application directory
+#if defined(LIBRW_SDL2)
+	char *basePath = SDL_GetBasePath();
+#elif defined(LIBRW_SDL3)
+	const char *basePath = SDL_GetBasePath();
+#else
+	char *basePath = nil;
+#endif
+
+	if(basePath) {
+		char logPath[512];
+		snprintf(logPath, sizeof(logPath), "%sGL_info.txt", basePath);
+		FILE *log = fopen(logPath, "w");
+
+		if(log) {
+			fprintf(log, "== OpenGL Info ==\n");
+			fprintf(log, "GL_VERSION: %s\n", version ? version : "N/A");
+			fprintf(log, "GL_VENDOR: %s\n", vendor ? vendor : "N/A");
+			fprintf(log, "GL_RENDERER: %s\n", renderer ? renderer : "N/A");
+			fprintf(log, "GL_SHADING_LANGUAGE_VERSION: %s\n", shadingLang ? shadingLang : "N/A");
+
+			fprintf(log, "\n== Supported Extensions ==\n");
+			if(extensions) {
+				char *extCopy = strdup(extensions);
+				char *token = strtok(extCopy, " ");
+				while(token) {
+					fprintf(log, "%s\n", token);
+					token = strtok(NULL, " ");
+				}
+				free(extCopy);
+			} else {
+				fprintf(log, "No extension info available.\n");
+			}
+
+			fprintf(log, "\n== Numeric GL Limits ==\n");
+			fprintf(log, "GL_MAX_VERTEX_ATTRIBS: %d\n", maxVertexAttribs);
+			fprintf(log, "GL_MAX_VERTEX_UNIFORM_VECTORS: %d\n", maxVertexUniforms);
+			fprintf(log, "GL_MAX_FRAGMENT_UNIFORM_VECTORS: %d\n", maxFragmentUniforms);
+			fprintf(log, "GL_MAX_TEXTURE_SIZE: %d\n", maxTextureSize);
+
+			fclose(log);
+			SDL_Log("GL info saved to: %sGL_info.txt", basePath);
+		}
+	}
+}
+
 
 struct UniformState
 {
@@ -1365,12 +1437,10 @@ beginUpdate(Camera *cam)
 
 	setFrameBuffer(cam);
 
-	if(isAdreno) //it's terrible hack, but...  
-	{
-		glDisable(GL_DEPTH_TEST);
-		glDepthMask(GL_FALSE);
-		glDisable(GL_STENCIL_TEST);
+	if(gl3Caps.gles) {
+		glDepthMask(GL_TRUE);
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+		glDepthMask(rwStateCache.zwrite);
 	}
 	
 	setViewport(cam->frameBuffer);
@@ -1612,58 +1682,7 @@ startSDL2(void)
 		return 0;
 	}
 
-#if !defined(__ANDROID__) && !defined(ANDROID)
-	printf("OpenGL version: %s\n", glGetString(GL_VERSION));
-#else
-	char logPath[256];
-	sprintf(logPath, "%s/GL_info.txt", getenv("GAMEFILES"));
-	FILE* log = fopen(logPath, "w");
-	const char *version     = (const char *)glGetString(GL_VERSION);
-    const char *vendor      = (const char *)glGetString(GL_VENDOR);
-    const char *renderer    = (const char *)glGetString(GL_RENDERER);
-    const char *extensions  = (const char *)glGetString(GL_EXTENSIONS);
-    const char *shadingLang = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
-
-	if (renderer && strstr(renderer, "Adreno") != nullptr) {
-		isAdreno = true;
-	} else if (vendor && strstr(vendor, "Qualcomm") != nullptr) {
-		isAdreno = true;
-	}
-	
-    fprintf(log, "== OpenGL ES Info ==\n");
-    fprintf(log, "GL_VERSION: %s\n", version     ? version     : "N/A");
-    fprintf(log, "GL_VENDOR: %s\n", vendor       ? vendor      : "N/A");
-    fprintf(log, "GL_RENDERER: %s\n", renderer   ? renderer    : "N/A");
-    fprintf(log, "GL_SHADING_LANGUAGE_VERSION: %s\n", shadingLang ? shadingLang : "N/A");
-    fprintf(log, "\n== Supported Extensions ==\n");
-
-    if (extensions) {
-        char *extCopy = strdup(extensions);
-        char *token = strtok(extCopy, " ");
-        while (token) {
-            fprintf(log, "%s\n", token);
-            token = strtok(NULL, " ");
-        }
-        free(extCopy);
-    } else {
-        fprintf(log, "No extension info available.\n");
-    }
-
-    fprintf(log, "\n== Numeric GL Limits (if supported) ==\n");
-
-    GLint maxVertexAttribs, maxVertexUniforms, maxFragmentUniforms, maxTextureSize;
-    glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &maxVertexAttribs);
-    glGetIntegerv(GL_MAX_VERTEX_UNIFORM_VECTORS, &maxVertexUniforms);
-    glGetIntegerv(GL_MAX_FRAGMENT_UNIFORM_VECTORS, &maxFragmentUniforms);
-    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
-
-    fprintf(log, "GL_MAX_VERTEX_ATTRIBS: %d\n", maxVertexAttribs);
-    fprintf(log, "GL_MAX_VERTEX_UNIFORM_VECTORS: %d\n", maxVertexUniforms);
-    fprintf(log, "GL_MAX_FRAGMENT_UNIFORM_VECTORS: %d\n", maxFragmentUniforms);
-    fprintf(log, "GL_MAX_TEXTURE_SIZE: %d\n", maxTextureSize);
-
-    fclose(log);
-#endif
+	logGLInfo();
 
 	glGlobals.window = win;
 	glGlobals.glcontext = ctx;
@@ -1841,58 +1860,7 @@ startSDL3(void)
 		return 0;
 	}
 
-#if !defined(__ANDROID__) && !defined(ANDROID)
-	printf("OpenGL version: %s\n", glGetString(GL_VERSION));
-#else
-	char logPath[256];
-	sprintf(logPath, "%s/GL_info.txt", getenv("GAMEFILES"));
-	FILE* log = fopen(logPath, "w");
-	const char *version     = (const char *)glGetString(GL_VERSION);
-    const char *vendor      = (const char *)glGetString(GL_VENDOR);
-    const char *renderer    = (const char *)glGetString(GL_RENDERER);
-    const char *extensions  = (const char *)glGetString(GL_EXTENSIONS);
-    const char *shadingLang = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
-
-	if (renderer && strstr(renderer, "Adreno") != nullptr) {
-		isAdreno = true;
-	} else if (vendor && strstr(vendor, "Qualcomm") != nullptr) {
-		isAdreno = true;
-	}
-	
-    fprintf(log, "== OpenGL ES Info ==\n");
-    fprintf(log, "GL_VERSION: %s\n", version     ? version     : "N/A");
-    fprintf(log, "GL_VENDOR: %s\n", vendor       ? vendor      : "N/A");
-    fprintf(log, "GL_RENDERER: %s\n", renderer   ? renderer    : "N/A");
-    fprintf(log, "GL_SHADING_LANGUAGE_VERSION: %s\n", shadingLang ? shadingLang : "N/A");
-    fprintf(log, "\n== Supported Extensions ==\n");
-
-    if (extensions) {
-        char *extCopy = strdup(extensions);
-        char *token = strtok(extCopy, " ");
-        while (token) {
-            fprintf(log, "%s\n", token);
-            token = strtok(NULL, " ");
-        }
-        free(extCopy);
-    } else {
-        fprintf(log, "No extension info available.\n");
-    }
-
-    fprintf(log, "\n== Numeric GL Limits (if supported) ==\n");
-
-    GLint maxVertexAttribs, maxVertexUniforms, maxFragmentUniforms, maxTextureSize;
-    glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &maxVertexAttribs);
-    glGetIntegerv(GL_MAX_VERTEX_UNIFORM_VECTORS, &maxVertexUniforms);
-    glGetIntegerv(GL_MAX_FRAGMENT_UNIFORM_VECTORS, &maxFragmentUniforms);
-    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
-
-    fprintf(log, "GL_MAX_VERTEX_ATTRIBS: %d\n", maxVertexAttribs);
-    fprintf(log, "GL_MAX_VERTEX_UNIFORM_VECTORS: %d\n", maxVertexUniforms);
-    fprintf(log, "GL_MAX_FRAGMENT_UNIFORM_VECTORS: %d\n", maxFragmentUniforms);
-    fprintf(log, "GL_MAX_TEXTURE_SIZE: %d\n", maxTextureSize);
-
-    fclose(log);
-#endif
+	logGLInfo();
 
 	glGlobals.window = win;
 	glGlobals.glcontext = ctx;

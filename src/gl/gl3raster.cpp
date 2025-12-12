@@ -438,7 +438,12 @@ uint8*
 rasterLock(Raster *raster, int32 level, int32 lockMode)
 {
 #ifdef RW_OPENGL
-	Gl3Raster *natras GETGL3RASTEREXT(raster);
+	// Get top-level parent raster (only parent has valid texture ID)
+	Raster *topRaster = raster;
+	while(topRaster != topRaster->parent)
+		topRaster = topRaster->parent;
+
+	Gl3Raster *natras = GETGL3RASTEREXT(topRaster);
 	uint8 *px;
 	uint32 allocSz;
 	int i;
@@ -449,19 +454,25 @@ rasterLock(Raster *raster, int32 level, int32 lockMode)
 	case Raster::NORMAL:
 	case Raster::TEXTURE:
 	case Raster::CAMERATEXTURE:
+		// Save original dimensions before modifying for mip level
+		topRaster->originalWidth = topRaster->width;
+		topRaster->originalHeight = topRaster->height;
+		topRaster->originalStride = topRaster->stride;
+
+		// Calculate mip level dimensions
 		for(i = 0; i < level; i++){
-			if(raster->width > 1){
-				raster->width /= 2;
-				raster->stride /= 2;
+			if(topRaster->width > 1){
+				topRaster->width /= 2;
+				topRaster->stride /= 2;
 			}
-			if(raster->height > 1)
-				raster->height /= 2;
+			if(topRaster->height > 1)
+				topRaster->height /= 2;
 		}
 
-		allocSz = getLevelSize(raster, level);
+		allocSz = getLevelSize(topRaster, level);
 		px = (uint8*)rwMalloc(allocSz, MEMDUR_EVENT | ID_DRIVER);
-		assert(raster->pixels == nil);
-		raster->pixels = px;
+		assert(topRaster->pixels == nil);
+		topRaster->pixels = px;
 
 		if(lockMode & Raster::LOCKREAD || !(lockMode & Raster::LOCKNOFETCH)){
 			if(natras->isCompressed){
@@ -482,7 +493,7 @@ rasterLock(Raster *raster, int32 level, int32 lockMode)
 				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, natras->texid, 0);
 				GLenum e = glCheckFramebufferStatus(GL_FRAMEBUFFER);
 assert(natras->format == GL_RGBA);
-				glReadPixels(0, 0, raster->width, raster->height, natras->format, natras->type, px);
+				glReadPixels(0, 0, topRaster->width, topRaster->height, natras->format, natras->type, px);
 //e = glGetError(); printf("GL err4 %x (%x)\n", e, natras->format);
 				bindFramebuffer(0);
 				glDeleteFramebuffers(1, &fbo);
@@ -494,24 +505,36 @@ assert(natras->format == GL_RGBA);
 			}
 		}
 
-		raster->privateFlags = lockMode;
+		// Set up raster->pixels to point to subraster region within topRaster
+		raster->pixels = topRaster->pixels +
+		                 topRaster->stride * raster->offsetY +
+		                 natras->bpp * raster->offsetX;
+
+		if(lockMode & Raster::LOCKREAD) raster->privateFlags |= Raster::PRIVATELOCK_READ;
+		if(lockMode & Raster::LOCKWRITE) raster->privateFlags |= Raster::PRIVATELOCK_WRITE;
 		break;
 
 	case Raster::CAMERA:
-		if(lockMode & Raster::PRIVATELOCK_WRITE)
+		if(lockMode & Raster::LOCKWRITE)
 			assert(0 && "can't lock framebuffer for writing");
-		raster->width = glGlobals.presentWidth;
-		raster->height = glGlobals.presentHeight;
-		raster->stride = raster->width*natras->bpp;
+		topRaster->width = glGlobals.presentWidth;
+		topRaster->height = glGlobals.presentHeight;
+		topRaster->stride = topRaster->width*natras->bpp;
 		assert(natras->bpp == 3);
-		allocSz = raster->height*raster->stride;
+		allocSz = topRaster->height*topRaster->stride;
 		px = (uint8*)rwMalloc(allocSz, MEMDUR_EVENT | ID_DRIVER);
-		assert(raster->pixels == nil);
-		raster->pixels = px;
+		assert(topRaster->pixels == nil);
+		topRaster->pixels = px;
 		glReadBuffer(GL_BACK);
-		glReadPixels(0, 0, raster->width, raster->height, GL_RGB, GL_UNSIGNED_BYTE, px);
+		glReadPixels(0, 0, topRaster->width, topRaster->height, GL_RGB, GL_UNSIGNED_BYTE, px);
 
-		raster->privateFlags = lockMode;
+		// Set up raster->pixels to point to subraster region
+		raster->pixels = topRaster->pixels +
+		                 topRaster->stride * raster->offsetY +
+		                 natras->bpp * raster->offsetX;
+
+		if(lockMode & Raster::LOCKREAD) raster->privateFlags |= Raster::PRIVATELOCK_READ;
+		if(lockMode & Raster::LOCKWRITE) raster->privateFlags |= Raster::PRIVATELOCK_WRITE;
 		break;
 
 	default:
@@ -519,7 +542,7 @@ assert(natras->format == GL_RGBA);
 		return nil;
 	}
 
-	return px;
+	return raster->pixels;
 #else
 	return nil;
 #endif
@@ -529,51 +552,89 @@ void
 rasterUnlock(Raster *raster, int32 level)
 {
 #ifdef RW_OPENGL
-	Gl3Raster *natras = GETGL3RASTEREXT(raster);
+	// Get top-level parent raster (only parent has valid texture ID)
+	Raster *topRaster = raster;
+	while(topRaster != topRaster->parent)
+		topRaster = topRaster->parent;
 
-	assert(raster->pixels);
+	Gl3Raster *natras = GETGL3RASTEREXT(topRaster);
 
-	switch(raster->type){
-	case Raster::NORMAL:
-	case Raster::TEXTURE:
-	case Raster::CAMERATEXTURE:
-		if(raster->privateFlags & Raster::LOCKWRITE){
-			uint32 prev = bindTexture(natras->texid);
-			if(natras->isCompressed){
-				glCompressedTexImage2D(GL_TEXTURE_2D, level, natras->internalFormat,
-					raster->width, raster->height, 0,
-					getLevelSize(raster, level),
-					raster->pixels);
-				if(natras->backingStore){
-					assert(level < natras->backingStore->numlevels);
-					memcpy(natras->backingStore->levels[level].data, raster->pixels,
-						natras->backingStore->levels[level].size);
-				}
-			} else if(level == 0) {
+	// Only upload if we locked for writing
+	if(raster->privateFlags & Raster::PRIVATELOCK_WRITE){
+		switch(raster->type){
+		case Raster::ZBUFFER:
+			// Cannot unlock zbuffer for writing
+			assert(0 && "cannot unlock zbuffer for writing");
+			break;
+
+		case Raster::CAMERA:
+			// TODO: CAMERA raster write is not directly supported in OpenGL 3+
+			break;
+
+		case Raster::NORMAL:
+		case Raster::TEXTURE:
+		case Raster::CAMERATEXTURE:
+			{
+				uint32 prev = bindTexture(natras->texid);
+
 				glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-				glTexImage2D(GL_TEXTURE_2D, level, natras->internalFormat,
-					     raster->width, raster->height,
-					     0, natras->format, natras->type, raster->pixels);
-			}
-			// if(level == 0 && natras->autogenMipmap)
-				glGenerateMipmap(GL_TEXTURE_2D);
-			bindTexture(prev);
-		}
-		break;
 
-	case Raster::CAMERA:
-		// TODO: write?
-		break;
+				if(natras->isCompressed){
+					glCompressedTexImage2D(GL_TEXTURE_2D, level,
+					                       natras->internalFormat,
+					                       topRaster->width, topRaster->height,
+					                       0,
+					                       getLevelSize(topRaster, level),
+					                       topRaster->pixels);
+				}else{
+					glTexImage2D(GL_TEXTURE_2D, level,
+					             natras->internalFormat,
+					             topRaster->width, topRaster->height,
+					             0,
+					             natras->format, natras->type,
+					             topRaster->pixels);
+				}
+
+				// Generate mipmaps if needed (only for level 0 with autogen enabled)
+				if(natras->autogenMipmap && level == 0){
+					glGenerateMipmap(GL_TEXTURE_2D);
+				}
+
+				// Update backing store if present (for GLES fallback)
+				if(natras->backingStore && level < natras->backingStore->numlevels){
+					uint32 size = getLevelSize(topRaster, level);
+					memcpy(natras->backingStore->levels[level].data, topRaster->pixels, size);
+				}
+
+				bindTexture(prev);
+			}
+			break;
+
+		default:
+			assert(0 && "invalid raster type");
+			break;
+		}
 	}
 
-	rwFree(raster->pixels);
+	// Restore original dimensions on topRaster
+	topRaster->width = topRaster->originalWidth;
+	topRaster->height = topRaster->originalHeight;
+	topRaster->stride = topRaster->originalStride;
+
+	// Free the pixel buffer allocated during lock
+	rwFree(topRaster->pixels);
+	topRaster->pixels = nil;
 	raster->pixels = nil;
+
+	// Clear lock flags
+	raster->privateFlags &= ~(Raster::PRIVATELOCK_READ|Raster::PRIVATELOCK_WRITE);
+#else
+    raster->width = raster->originalWidth;
+    raster->height = raster->originalHeight;
+    raster->stride = raster->originalStride;
+    raster->pixels = raster->originalPixels;
+    raster->privateFlags = 0;
 #endif
-	raster->width = raster->originalWidth;
-	raster->height = raster->originalHeight;
-	raster->stride = raster->originalStride;
-	raster->pixels = raster->originalPixels;
-	raster->privateFlags = 0;
 }
 
 int32
