@@ -30,11 +30,11 @@ bool32 needToReadBackTextures;
 int32   alphaFunc;
 float32 alphaRef;
 
-#if defined(LIBRW_SDL2) || defined(LIBRW_SDL3)
-// Helper function to log OpenGL info using SDL logging and optionally to file
+// Helper function to log OpenGL info
 static void
 logGLInfo(void)
 {
+#if defined(LIBRW_SDL2) || defined(LIBRW_SDL3)
 	const char *version     = (const char *)glGetString(GL_VERSION);
 	const char *vendor      = (const char *)glGetString(GL_VENDOR);
 	const char *renderer    = (const char *)glGetString(GL_RENDERER);
@@ -58,14 +58,8 @@ logGLInfo(void)
 	SDL_Log("GL_MAX_FRAGMENT_UNIFORM_VECTORS: %d", maxFragmentUniforms);
 	SDL_Log("GL_MAX_TEXTURE_SIZE: %d", maxTextureSize);
 
-	// Try to also write to file in application directory
-#if defined(LIBRW_SDL2)
-	char *basePath = SDL_GetBasePath();
-#elif defined(LIBRW_SDL3)
-	const char *basePath = SDL_GetBasePath();
-#else
-	char *basePath = nil;
-#endif
+#if defined(LIBRW_GL_LOG_INFO)
+	char *basePath = (char *)SDL_GetBasePath();
 
 	if(basePath) {
 		char logPath[512];
@@ -102,8 +96,12 @@ logGLInfo(void)
 			SDL_Log("GL info saved to: %sGL_info.txt", basePath);
 		}
 	}
-}
 #endif
+#else
+	printf("OpenGL version: %s\n", glGetString(GL_VERSION));
+#endif
+}
+
 
 struct UniformState
 {
@@ -1653,19 +1651,16 @@ startSDL2(void)
 
 		if(mode->flags & VIDEOMODEEXCLUSIVE) {
 			win = SDL_CreateWindow(glGlobals.winTitle, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, mode->mode.w, mode->mode.h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN);
-			if (win)
+			if (win) {
 				SDL_SetWindowDisplayMode(win, &mode->mode);
+			}
 		} else {
-#if defined(__ANDROID__) || defined(ANDROID)
-			// Use 0,0 to let SDL use the native screen resolution
-			win = SDL_CreateWindow(glGlobals.winTitle, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 0, 0, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN);
-#else
 			win = SDL_CreateWindow(glGlobals.winTitle, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, glGlobals.winWidth, glGlobals.winHeight, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
-#endif
-			if (win)
+			if (win) {
 				SDL_SetWindowDisplayMode(win, NULL);
+			}
 		}
-		if(win){
+		if(win) {
 			gl3Caps.gles = profiles[i].gl == SDL_GL_CONTEXT_PROFILE_ES;
 			gl3Caps.glversion = profiles[i].major*10 + profiles[i].minor;
 			break;
@@ -1739,12 +1734,12 @@ makeVideoModeList(SDL_DisplayID displayIndex, SDL_DisplayID *displays)
 	modes = SDL_GetFullscreenDisplayModes(displayIndex, &num);
 
 	rwFree(glGlobals.modes);
-	glGlobals.modes = rwNewT(DisplayMode, num+(currentMode != NULL ? 1 : 0)+1, ID_DRIVER | MEMDUR_EVENT);
+	glGlobals.modes = rwNewT(DisplayMode, num+(currentMode != NULL ? 1 : 0) + 1, ID_DRIVER | MEMDUR_EVENT);
 	glGlobals.numModes = 0;
 
 	if (currentMode) {
 		glGlobals.modes[0].mode = *currentMode;
-#if defined(__ANDROID__) || defined(ANDROID)
+#if defined(__ANDROID__)
 		// Android always runs fullscreen, so mark the mode as exclusive
 		glGlobals.modes[0].flags = VIDEOMODEEXCLUSIVE;
 #else
@@ -1831,19 +1826,16 @@ startSDL3(void)
 
 		if(mode->flags & VIDEOMODEEXCLUSIVE) {
 			win = SDL_CreateWindow(glGlobals.winTitle, mode->mode.w, mode->mode.h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN);
-			if (win)
+			if (win) {
 				SDL_SetWindowFullscreenMode(win, &mode->mode);
+			}
 		} else {
-#if defined(__ANDROID__) || defined(ANDROID)
-			// Use 0,0 to let SDL use the native screen resolution
-			win = SDL_CreateWindow(glGlobals.winTitle, 0, 0, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN);
-#else
 			win = SDL_CreateWindow(glGlobals.winTitle, glGlobals.winWidth, glGlobals.winHeight, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
-#endif
-			if (win)
+			if (win) {
 				SDL_SetWindowFullscreenMode(win, NULL);
+			}
 		}
-		if(win){
+		if(win) {
 			gl3Caps.gles = profiles[i].gl == SDL_GL_CONTEXT_PROFILE_ES;
 			gl3Caps.glversion = profiles[i].major*10 + profiles[i].minor;
 			break;
