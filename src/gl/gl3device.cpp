@@ -31,6 +31,7 @@ bool32 needToReadBackTextures;
 int32   alphaFunc;
 float32 alphaRef;
 
+#if defined(LIBRW_SDL2) || defined(LIBRW_SDL3)
 // Helper function to log OpenGL info using SDL logging and optionally to file
 static void
 logGLInfo(void)
@@ -103,7 +104,7 @@ logGLInfo(void)
 		}
 	}
 }
-
+#endif
 
 struct UniformState
 {
