@@ -59,7 +59,7 @@ logGLInfo(void)
 	SDL_Log("GL_MAX_TEXTURE_SIZE: %d", maxTextureSize);
 
 #if defined(LIBRW_GL_LOG_INFO)
-	char *basePath = (char *)SDL_GetBasePath();
+	const char *basePath = SDL_GetBasePath();
 
 	if(basePath) {
 		char logPath[512];
