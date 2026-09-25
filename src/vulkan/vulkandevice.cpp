@@ -148,8 +148,9 @@ struct FrameTextureUploadGarbage
 	uint32 geometryCapacity;
 	// dynamic buffers that overflowed while this frame was recorded; the
 	// command buffer still references them until the frame's fence signals
-	VulkanBuffer retiredBuffers[16];
+	VulkanBuffer *retiredBuffers;
 	uint32 numRetiredBuffers;
+	uint32 retiredBufferCapacity;
 };
 
 // Sub-allocator for static geometry and texture memory
@@ -425,7 +426,6 @@ struct VulkanGlobals
 	VulkanBuffer uploadStaging[MAX_FRAMES_IN_FLIGHT];
 	VkDeviceSize uploadStagingOffset;
 	bool32 mipmapBlitSupported;
-	bool32 litUniformOverflow[MAX_FRAMES_IN_FLIGHT];
 	VkFormat pipelineColorFormat;
 	VkFormat pipelineDepthFormat;
 	Camera *viewProjCamera;
@@ -457,6 +457,7 @@ static void destroyTextureHandles(VkImage *image, VkDeviceMemory *memory, Vulkan
 static bool32 keepTextureGarbage(uint32 frame, VkImage image, VkDeviceMemory memory, VulkanAllocation *alloc, VkImageView view, VkSampler sampler, VkDescriptorSet descriptorSet);
 static bool32 keepGeometryGarbage(uint32 frame, VulkanAllocation *alloc);
 static uint32 garbageFrame(void);
+static bool32 retireBufferToFrame(uint32 frame, VulkanBuffer *buffer);
 static VkSampler getOrCreateSampler(VkSamplerAddressMode addressModeU, VkSamplerAddressMode addressModeV,
 	VkFilter magFilter, VkFilter minFilter, VkSamplerMipmapMode mipmapMode,
 	VkBorderColor borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK);
@@ -955,13 +956,9 @@ allocDynamicBuffer(VulkanBuffer *buffer, VkDeviceSize *cursor,
 		VkDeviceSize newCap = buffer->capacity ? buffer->capacity * 2 : 16ull * 1024ull * 1024ull;
 		while(newCap < size)
 			newCap *= 2;
-		if(buffer->buffer != VK_NULL_HANDLE){
-			FrameTextureUploadGarbage *garbage = &vkGlobals.textureUploadGarbage[ctx->currentFrame];
-			if(garbage->numRetiredBuffers >= nelem(garbage->retiredBuffers))
-				return nil;
-			garbage->retiredBuffers[garbage->numRetiredBuffers++] = *buffer;
-			memset(buffer, 0, sizeof(*buffer));
-		}
+		if(buffer->buffer != VK_NULL_HANDLE &&
+		   !retireBufferToFrame(ctx->currentFrame, buffer))
+			return nil;
 		if(!createBuffer(buffer, newCap, usage))
 			return nil;
 		offset = 0;
@@ -2034,6 +2031,20 @@ growGarbageList(T **list, uint32 count, uint32 *capacity)
 	return 1;
 }
 
+// Keep a buffer alive until the given frame slot retires
+static bool32
+retireBufferToFrame(uint32 frame, VulkanBuffer *buffer)
+{
+	if(frame >= MAX_FRAMES_IN_FLIGHT)
+		return 0;
+	FrameTextureUploadGarbage *garbage = &vkGlobals.textureUploadGarbage[frame];
+	if(!growGarbageList(&garbage->retiredBuffers, garbage->numRetiredBuffers, &garbage->retiredBufferCapacity))
+		return 0;
+	garbage->retiredBuffers[garbage->numRetiredBuffers++] = *buffer;
+	memset(buffer, 0, sizeof(*buffer));
+	return 1;
+}
+
 static bool32
 keepTextureGarbage(uint32 frame, VkImage image, VkDeviceMemory memory, VulkanAllocation *alloc,
 	VkImageView view, VkSampler sampler, VkDescriptorSet descriptorSet)
@@ -2154,6 +2165,9 @@ destroyTextureUploadResources(void)
 		rwFree(garbage->geometries);
 		garbage->geometries = nil;
 		garbage->geometryCapacity = 0;
+		rwFree(garbage->retiredBuffers);
+		garbage->retiredBuffers = nil;
+		garbage->retiredBufferCapacity = 0;
 		destroyBuffer(&vkGlobals.uploadStaging[frame]);
 	}
 	vkGlobals.numPendingTextureUploads = 0;
@@ -2281,10 +2295,13 @@ uploadTextureForFrame(Raster *raster, VkCommandBuffer commandBuffer, VkDeviceSiz
 		&natras->image, &natras->imageAlloc, &natras->imageView, &natras->sampler, &natras->descriptorSet,
 		addrModeU, addrModeV, magF, minF, mipM);
 	if(dedicated.buffer != VK_NULL_HANDLE){
-		if(ok && !keepTextureUploadStaging(ctx->currentFrame, raster, &dedicated)){
-			// can't keep the staging buffer alive until the copy ran
-			retireRasterGpuTexture(natras);
-			ok = 0;
+		// On success the copy is recorded, so the staging buffer has to
+		// outlive this frame. On failure nothing referencing it was recorded.
+		if(ok && !keepTextureUploadStaging(ctx->currentFrame, raster, &dedicated) &&
+		   !retireBufferToFrame(ctx->currentFrame, &dedicated)){
+			// Out of memory for bookkeeping. The recorded copy still reads
+			// the buffer, so leak it rather than free it under the GPU.
+			memset(&dedicated, 0, sizeof(dedicated));
 		}
 		if(!ok)
 			destroyBuffer(&dedicated);
@@ -2846,7 +2863,8 @@ createTextureDescriptors(void)
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 	poolSizes[0].descriptorCount = 8192;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-	poolSizes[1].descriptorCount = MAX_FRAMES_IN_FLIGHT;
+	// a few spares so a frame can switch to a bigger lit uniform buffer
+	poolSizes[1].descriptorCount = MAX_FRAMES_IN_FLIGHT*8;
 	uint32 poolSizeCount = 2;
 	if(ctx->rayQueryEnabled){
 		poolSizes[2].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
@@ -2860,7 +2878,7 @@ createTextureDescriptors(void)
 	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
 	poolInfo.poolSizeCount = poolSizeCount;
 	poolInfo.pPoolSizes = poolSizes;
-	poolInfo.maxSets = 8192 + MAX_FRAMES_IN_FLIGHT + (ctx->rayQueryEnabled ? MAX_FRAMES_IN_FLIGHT : 0);
+	poolInfo.maxSets = 8192 + MAX_FRAMES_IN_FLIGHT*8 + (ctx->rayQueryEnabled ? MAX_FRAMES_IN_FLIGHT : 0);
 	if(!vkOk(vkCreateDescriptorPool(ctx->device, &poolInfo, nil, &vkGlobals.descriptorPool),
 	         "vkCreateDescriptorPool"))
 		return 0;
@@ -5054,16 +5072,6 @@ beginFrame(void)
 	retireTextureUploadGarbage(ctx->currentFrame);
 	vkGlobals.uploadStagingOffset = 0;
 
-	// The lit uniform buffer ran out last time this frame slot was used.
-	// Its descriptor set can only be repointed now that the slot is idle.
-	if(vkGlobals.litUniformOverflow[ctx->currentFrame]){
-		VulkanBuffer *ubo = &vkGlobals.litUniformBuffers[ctx->currentFrame];
-		VkDeviceSize newSize = ubo->capacity ? ubo->capacity*2 : DYNAMIC_LIT_UNIFORM_BUFFER_SIZE;
-		destroyBuffer(ubo);
-		createBuffer(ubo, newSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-		vkGlobals.litUniformOverflow[ctx->currentFrame] = 0;
-	}
-
 	VkResult result = vkAcquireNextImageKHR(ctx->device, ctx->swapchain, UINT64_MAX,
 		ctx->imageAvailable[ctx->currentFrame], VK_NULL_HANDLE, &ctx->currentImage);
 	if(result == VK_ERROR_SURFACE_LOST_KHR)
@@ -6219,6 +6227,65 @@ ensureLitUniformResources(void)
 	return 1;
 }
 
+// The frame's lit uniform buffer is full. Its descriptor set is referenced
+// by commands already recorded this frame and can't be repointed, so the
+// rest of the frame gets a bigger buffer behind a new descriptor set; the old
+// pair is released when the frame retires.
+static bool32
+growLitUniformBuffer(void)
+{
+	Context *ctx = &vkGlobals.context;
+	uint32 frame = ctx->currentFrame;
+	VulkanBuffer *buffer = &vkGlobals.litUniformBuffers[frame];
+	VkDeviceSize newSize = buffer->capacity ? buffer->capacity*2 : DYNAMIC_LIT_UNIFORM_BUFFER_SIZE;
+
+	VkDescriptorSet newSet = VK_NULL_HANDLE;
+	VkDescriptorSetAllocateInfo allocInfo;
+	memset(&allocInfo, 0, sizeof(allocInfo));
+	allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	allocInfo.descriptorPool = vkGlobals.descriptorPool;
+	allocInfo.descriptorSetCount = 1;
+	allocInfo.pSetLayouts = &vkGlobals.litSetLayout;
+	if(!vkOk(vkAllocateDescriptorSets(ctx->device, &allocInfo, &newSet), "vkAllocateDescriptorSets(lit grow)"))
+		return 0;
+	VulkanBuffer newBuffer;
+	if(!createBuffer(&newBuffer, newSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)){
+		vkFreeDescriptorSets(ctx->device, vkGlobals.descriptorPool, 1, &newSet);
+		return 0;
+	}
+
+	VkDescriptorBufferInfo bufferInfo;
+	memset(&bufferInfo, 0, sizeof(bufferInfo));
+	bufferInfo.buffer = newBuffer.buffer;
+	bufferInfo.offset = 0;
+	bufferInfo.range = sizeof(Lit3DUniforms);
+	VkWriteDescriptorSet write;
+	memset(&write, 0, sizeof(write));
+	write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	write.dstSet = newSet;
+	write.dstBinding = 0;
+	write.descriptorCount = 1;
+	write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+	write.pBufferInfo = &bufferInfo;
+	vkUpdateDescriptorSets(ctx->device, 1, &write, 0, nil);
+
+	if(buffer->buffer != VK_NULL_HANDLE && !retireBufferToFrame(frame, buffer)){
+		destroyBuffer(&newBuffer);
+		vkFreeDescriptorSets(ctx->device, vkGlobals.descriptorPool, 1, &newSet);
+		return 0;
+	}
+	VkDescriptorSet oldSet = vkGlobals.litDescriptorSets[frame];
+	if(oldSet != VK_NULL_HANDLE)
+		// if even this fails the set just stays allocated until the pool dies
+		keepTextureGarbage(frame, VK_NULL_HANDLE, VK_NULL_HANDLE, nil, VK_NULL_HANDLE, VK_NULL_HANDLE, oldSet);
+
+	*buffer = newBuffer;
+	vkGlobals.litDescriptorSets[frame] = newSet;
+	vkGlobals.litDescriptorBuffers[frame] = newBuffer.buffer;
+	vkGlobals.litUniformOffset = 0;
+	return 1;
+}
+
 static bool32
 uploadLitUniforms(const Lit3DUniforms *u, uint32 *dynamicOffset)
 {
@@ -6226,10 +6293,9 @@ uploadLitUniforms(const Lit3DUniforms *u, uint32 *dynamicOffset)
 	VulkanBuffer *buffer = &vkGlobals.litUniformBuffers[ctx->currentFrame];
 	VkDeviceSize offset = alignDynamicOffset(vkGlobals.litUniformOffset, vkGlobals.uboAlignment);
 	if(buffer->buffer == VK_NULL_HANDLE || offset + sizeof(*u) > buffer->capacity){
-		// The frame's descriptor set points at this buffer, so a bigger one
-		// can only replace it when this frame slot comes around again.
-		vkGlobals.litUniformOverflow[ctx->currentFrame] = 1;
-		return 0;
+		if(!growLitUniformBuffer())
+			return 0;
+		offset = 0;
 	}
 	memcpy((uint8*)buffer->mapped + offset, u, sizeof(*u));
 	vkGlobals.litUniformOffset = offset + sizeof(*u);
@@ -6860,7 +6926,7 @@ matfxRenderCB(Atomic *atomic)
 	makeLitUniforms(atomic, &u, &p);
 	// Meshes without an env map all share the plain uniforms, upload them once
 	uint32 baseOffset = 0;
-	bool32 baseUploaded = 0;
+	VkDescriptorSet baseSet = VK_NULL_HANDLE;	// set baseOffset belongs to
 
 	VkDeviceSize vertexOffset = header->vertexOffset;
 	vkCmdBindVertexBuffers(cmd, 0, 1, &header->vertexBuffer, &vertexOffset);
@@ -6936,10 +7002,11 @@ matfxRenderCB(Atomic *atomic)
 			if(!uploadLitUniforms(&envU, &dynamicOffset))
 				return;
 		}else{
-			if(!baseUploaded){
+			// an env map upload may have switched to a new uniform buffer
+			if(baseSet != vkGlobals.litDescriptorSets[ctx->currentFrame]){
 				if(!uploadLitUniforms(&u, &baseOffset))
 					return;
-				baseUploaded = 1;
+				baseSet = vkGlobals.litDescriptorSets[ctx->currentFrame];
 			}
 			dynamicOffset = baseOffset;
 		}
