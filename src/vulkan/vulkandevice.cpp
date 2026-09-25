@@ -124,16 +124,15 @@ struct TextureGarbage
 {
 	VkImage image;
 	VkDeviceMemory memory;
+	VulkanAllocation alloc;
 	VkImageView view;
 	VkSampler sampler;
+	VkDescriptorSet descriptorSet;
 };
 
 struct GeometryGarbage
 {
-	VkBuffer vertexBuffer;
-	VkDeviceMemory vertexBufferMemory;
-	VkBuffer indexBuffer;
-	VkDeviceMemory indexBufferMemory;
+	VulkanAllocation alloc;
 };
 
 struct FrameTextureUploadGarbage
@@ -141,10 +140,45 @@ struct FrameTextureUploadGarbage
 	VulkanBuffer staging[256];
 	Raster *raster[256];
 	uint32 numStaging;
-	TextureGarbage textures[1024];
+	TextureGarbage *textures;
 	uint32 numTextures;
-	GeometryGarbage geometries[1024];
+	uint32 textureCapacity;
+	GeometryGarbage *geometries;
 	uint32 numGeometries;
+	uint32 geometryCapacity;
+	// dynamic buffers that overflowed while this frame was recorded; the
+	// command buffer still references them until the frame's fence signals
+	VulkanBuffer retiredBuffers[16];
+	uint32 numRetiredBuffers;
+};
+
+// Sub-allocator for static geometry and texture memory
+enum GpuHeapKind
+{
+	GPU_HEAP_BUFFER,	// host visible, one VkBuffer spans the whole block
+	GPU_HEAP_IMAGE,		// device local, optimal tiling images only
+	GPU_HEAP_COUNT
+};
+
+struct GpuFreeRange
+{
+	VkDeviceSize offset;
+	VkDeviceSize size;
+};
+
+struct GpuBlock
+{
+	VkDeviceMemory memory;
+	VkBuffer buffer;
+	uint8 *mapped;
+	VkDeviceSize size;
+	VkDeviceSize used;
+	uint32 memoryType;
+	bool32 dedicated;
+	GpuFreeRange *ranges;	// sorted by offset, never adjacent
+	uint32 numRanges;
+	uint32 rangeCapacity;
+	GpuBlock *next;
 };
 
 
@@ -281,6 +315,9 @@ static const VkDeviceSize TEXTURE_UPLOAD_BYTES_PER_FRAME = 16ull * 1024ull * 102
 static const uint32 TEXTURE_UPLOADS_PER_FRAME = 12;
 static const uint64 TEXTURE_UPLOAD_USECS_PER_FRAME = 4000;
 static const uint32 MAX_RAY_PENDING_INSTANCES = 8192;
+static const VkDeviceSize GPU_BUFFER_BLOCK_SIZE = 16ull * 1024ull * 1024ull;
+static const VkDeviceSize GPU_IMAGE_BLOCK_SIZE = 64ull * 1024ull * 1024ull;
+static const VkDeviceSize GPU_BUFFER_ALIGNMENT = 64;
 
 struct VulkanSamplerKey
 {
@@ -381,6 +418,18 @@ struct VulkanGlobals
 	PipelineKind currentDescriptorSetKind;
 	bool renderStateSet[GSALPHATESTREF+1];
 	VulkanSamplerPool samplerPool;
+	VkPhysicalDeviceMemoryProperties memProperties;
+	bool32 memPropertiesValid;
+	GpuBlock *heapBlocks[GPU_HEAP_COUNT];
+	uint32 heapGeneration;
+	VulkanBuffer uploadStaging[MAX_FRAMES_IN_FLIGHT];
+	VkDeviceSize uploadStagingOffset;
+	bool32 mipmapBlitSupported;
+	bool32 litUniformOverflow[MAX_FRAMES_IN_FLIGHT];
+	VkFormat pipelineColorFormat;
+	VkFormat pipelineDepthFormat;
+	Camera *viewProjCamera;
+	RawMatrix camViewProj;
 };
 
 static VulkanGlobals vkGlobals;
@@ -404,9 +453,10 @@ vkOk(VkResult result, const char *what)
 static void copyIdentity(float *m);
 static void queueTextureUpload(Raster *raster);
 static void removeTextureUploadGarbageForRaster(Raster *raster);
-static void destroyTextureHandles(VkImage *image, VkDeviceMemory *memory, VkImageView *view, VkSampler *sampler);
-static bool32 keepTextureGarbage(uint32 frame, VkImage image, VkDeviceMemory memory, VkImageView view, VkSampler sampler);
-static bool32 keepGeometryGarbage(uint32 frame, VkBuffer vertexBuffer, VkDeviceMemory vertexBufferMemory, VkBuffer indexBuffer, VkDeviceMemory indexBufferMemory);
+static void destroyTextureHandles(VkImage *image, VkDeviceMemory *memory, VulkanAllocation *alloc, VkImageView *view, VkSampler *sampler);
+static bool32 keepTextureGarbage(uint32 frame, VkImage image, VkDeviceMemory memory, VulkanAllocation *alloc, VkImageView view, VkSampler sampler, VkDescriptorSet descriptorSet);
+static bool32 keepGeometryGarbage(uint32 frame, VulkanAllocation *alloc);
+static uint32 garbageFrame(void);
 static VkSampler getOrCreateSampler(VkSamplerAddressMode addressModeU, VkSamplerAddressMode addressModeV,
 	VkFilter magFilter, VkFilter minFilter, VkSamplerMipmapMode mipmapMode,
 	VkBorderColor borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK);
@@ -419,14 +469,33 @@ apiVersionAtLeast(uint32 version, uint32 major, uint32 minor)
 	       (VK_VERSION_MAJOR(version) == major && VK_VERSION_MINOR(version) >= minor);
 }
 
+static VkPhysicalDeviceMemoryProperties*
+getMemoryProperties(void)
+{
+	if(!vkGlobals.memPropertiesValid){
+		vkGetPhysicalDeviceMemoryProperties(vkGlobals.context.physicalDevice, &vkGlobals.memProperties);
+		vkGlobals.memPropertiesValid = 1;
+	}
+	return &vkGlobals.memProperties;
+}
+
 static uint32
 findMemoryType(uint32 typeFilter, VkMemoryPropertyFlags properties)
 {
-	VkPhysicalDeviceMemoryProperties memProperties;
-	vkGetPhysicalDeviceMemoryProperties(vkGlobals.context.physicalDevice, &memProperties);
-	for(uint32 i = 0; i < memProperties.memoryTypeCount; i++)
+	VkPhysicalDeviceMemoryProperties *memProperties = getMemoryProperties();
+	// Host visible memory that is also device local is what mobile GPUs
+	// (unified memory) want for vertex and index data, so prefer it.
+	if((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+	   (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0){
+		VkMemoryPropertyFlags preferred = properties | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		for(uint32 i = 0; i < memProperties->memoryTypeCount; i++)
+			if((typeFilter & (1u << i)) &&
+			   (memProperties->memoryTypes[i].propertyFlags & preferred) == preferred)
+				return i;
+	}
+	for(uint32 i = 0; i < memProperties->memoryTypeCount; i++)
 		if((typeFilter & (1u << i)) &&
-		   (memProperties.memoryTypes[i].propertyFlags & properties) == properties)
+		   (memProperties->memoryTypes[i].propertyFlags & properties) == properties)
 			return i;
 	assert(0 && "No compatible Vulkan memory type");
 	return 0;
@@ -559,6 +628,284 @@ getBufferDeviceAddress(VkBuffer buffer)
 	return ctx->getBufferDeviceAddressKHR(ctx->device, &info);
 }
 
+//
+// GPU memory sub-allocator
+//
+// Every geometry and texture used to get its own vkAllocateMemory. That is
+// slow (streaming hitches) and mobile drivers cap the number of live
+// allocations, so they now come out of a few big blocks instead.
+//
+
+static bool32
+gpuBlockReserveRanges(GpuBlock *block, uint32 count)
+{
+	if(block->rangeCapacity >= count)
+		return 1;
+	uint32 newCapacity = block->rangeCapacity ? block->rangeCapacity*2 : 16;
+	while(newCapacity < count)
+		newCapacity *= 2;
+	GpuFreeRange *ranges = rwNewT(GpuFreeRange, newCapacity, MEMDUR_EVENT | ID_DRIVER);
+	if(ranges == nil)
+		return 0;
+	if(block->ranges){
+		memcpy(ranges, block->ranges, sizeof(GpuFreeRange)*block->numRanges);
+		rwFree(block->ranges);
+	}
+	block->ranges = ranges;
+	block->rangeCapacity = newCapacity;
+	return 1;
+}
+
+static void
+gpuDestroyBlock(GpuBlock *block)
+{
+	Context *ctx = &vkGlobals.context;
+	if(ctx->device != VK_NULL_HANDLE){
+		if(block->buffer != VK_NULL_HANDLE)
+			vkDestroyBuffer(ctx->device, block->buffer, nil);
+		if(block->mapped)
+			vkUnmapMemory(ctx->device, block->memory);
+		if(block->memory != VK_NULL_HANDLE)
+			vkFreeMemory(ctx->device, block->memory, nil);
+	}
+	rwFree(block->ranges);
+	rwFree(block);
+}
+
+static GpuBlock*
+gpuCreateBlock(GpuHeapKind kind, VkDeviceSize size, uint32 memoryTypeBits, bool32 dedicated)
+{
+	Context *ctx = &vkGlobals.context;
+	GpuBlock *block = rwNewT(GpuBlock, 1, MEMDUR_EVENT | ID_DRIVER);
+	if(block == nil)
+		return nil;
+	memset(block, 0, sizeof(*block));
+
+	VkMemoryRequirements memRequirements;
+	VkMemoryPropertyFlags properties;
+	if(kind == GPU_HEAP_BUFFER){
+		VkBufferCreateInfo bufferInfo;
+		memset(&bufferInfo, 0, sizeof(bufferInfo));
+		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		bufferInfo.size = size;
+		bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		if(!vkOk(vkCreateBuffer(ctx->device, &bufferInfo, nil, &block->buffer), "vkCreateBuffer(heap)")){
+			gpuDestroyBlock(block);
+			return nil;
+		}
+		vkGetBufferMemoryRequirements(ctx->device, block->buffer, &memRequirements);
+		properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	}else{
+		memRequirements.size = size;
+		memRequirements.alignment = 1;
+		memRequirements.memoryTypeBits = memoryTypeBits;
+		properties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	}
+
+	VkMemoryAllocateInfo allocInfo;
+	memset(&allocInfo, 0, sizeof(allocInfo));
+	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocInfo.allocationSize = memRequirements.size;
+	allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
+	if(!vkOk(vkAllocateMemory(ctx->device, &allocInfo, nil, &block->memory), "vkAllocateMemory(heap)")){
+		gpuDestroyBlock(block);
+		return nil;
+	}
+	if(block->buffer != VK_NULL_HANDLE){
+		void *mapped = nil;
+		if(!vkOk(vkBindBufferMemory(ctx->device, block->buffer, block->memory, 0), "vkBindBufferMemory(heap)") ||
+		   !vkOk(vkMapMemory(ctx->device, block->memory, 0, VK_WHOLE_SIZE, 0, &mapped), "vkMapMemory(heap)")){
+			gpuDestroyBlock(block);
+			return nil;
+		}
+		block->mapped = (uint8*)mapped;
+	}
+
+	block->size = size;
+	block->memoryType = allocInfo.memoryTypeIndex;
+	block->dedicated = dedicated;
+	if(!gpuBlockReserveRanges(block, 1)){
+		gpuDestroyBlock(block);
+		return nil;
+	}
+	block->ranges[0].offset = 0;
+	block->ranges[0].size = size;
+	block->numRanges = 1;
+
+	block->next = vkGlobals.heapBlocks[kind];
+	vkGlobals.heapBlocks[kind] = block;
+	return block;
+}
+
+// First fit inside one block
+static bool32
+gpuBlockAlloc(GpuBlock *block, VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize *offsetOut)
+{
+	for(uint32 i = 0; i < block->numRanges; i++){
+		GpuFreeRange *r = &block->ranges[i];
+		VkDeviceSize start = (r->offset + alignment - 1) / alignment * alignment;
+		VkDeviceSize end = start + size;
+		if(end > r->offset + r->size)
+			continue;
+		VkDeviceSize rangeEnd = r->offset + r->size;
+		bool32 hasHead = start > r->offset;
+		bool32 hasTail = end < rangeEnd;
+		if(hasHead && hasTail){
+			if(!gpuBlockReserveRanges(block, block->numRanges+1))
+				return 0;
+			r = &block->ranges[i];
+			memmove(&block->ranges[i+2], &block->ranges[i+1],
+				sizeof(GpuFreeRange)*(block->numRanges - i - 1));
+			block->ranges[i+1].offset = end;
+			block->ranges[i+1].size = rangeEnd - end;
+			r->size = start - r->offset;
+			block->numRanges++;
+		}else if(hasHead){
+			r->size = start - r->offset;
+		}else if(hasTail){
+			r->offset = end;
+			r->size = rangeEnd - end;
+		}else{
+			memmove(&block->ranges[i], &block->ranges[i+1],
+				sizeof(GpuFreeRange)*(block->numRanges - i - 1));
+			block->numRanges--;
+		}
+		block->used += size;
+		*offsetOut = start;
+		return 1;
+	}
+	return 0;
+}
+
+static void
+gpuBlockFree(GpuBlock *block, VkDeviceSize offset, VkDeviceSize size)
+{
+	uint32 i = 0;
+	while(i < block->numRanges && block->ranges[i].offset < offset)
+		i++;
+	bool32 mergePrev = i > 0 &&
+		block->ranges[i-1].offset + block->ranges[i-1].size == offset;
+	bool32 mergeNext = i < block->numRanges &&
+		offset + size == block->ranges[i].offset;
+	if(mergePrev && mergeNext){
+		block->ranges[i-1].size += size + block->ranges[i].size;
+		memmove(&block->ranges[i], &block->ranges[i+1],
+			sizeof(GpuFreeRange)*(block->numRanges - i - 1));
+		block->numRanges--;
+	}else if(mergePrev){
+		block->ranges[i-1].size += size;
+	}else if(mergeNext){
+		block->ranges[i].offset = offset;
+		block->ranges[i].size += size;
+	}else{
+		// Can't grow the range list: leak the range rather than corrupt it
+		if(!gpuBlockReserveRanges(block, block->numRanges+1))
+			return;
+		memmove(&block->ranges[i+1], &block->ranges[i],
+			sizeof(GpuFreeRange)*(block->numRanges - i));
+		block->ranges[i].offset = offset;
+		block->ranges[i].size = size;
+		block->numRanges++;
+	}
+	block->used -= size;
+}
+
+static bool32
+gpuAlloc(GpuHeapKind kind, VkDeviceSize size, VkDeviceSize alignment, uint32 memoryTypeBits,
+	VulkanAllocation *alloc)
+{
+	memset(alloc, 0, sizeof(*alloc));
+	if(size == 0)
+		size = 1;
+	if(alignment == 0)
+		alignment = 1;
+	VkDeviceSize blockSize = kind == GPU_HEAP_BUFFER ? GPU_BUFFER_BLOCK_SIZE : GPU_IMAGE_BLOCK_SIZE;
+
+	VkDeviceSize offset = 0;
+	GpuBlock *block = nil;
+	if(size <= blockSize/2){
+		for(GpuBlock *b = vkGlobals.heapBlocks[kind]; b; b = b->next){
+			if(b->dedicated || (memoryTypeBits & (1u << b->memoryType)) == 0)
+				continue;
+			if(b->size - b->used < size)
+				continue;
+			if(gpuBlockAlloc(b, size, alignment, &offset)){
+				block = b;
+				break;
+			}
+		}
+		if(block == nil){
+			block = gpuCreateBlock(kind, blockSize, memoryTypeBits, 0);
+			if(block == nil || !gpuBlockAlloc(block, size, alignment, &offset))
+				return 0;
+		}
+	}else{
+		// big resources get a block of their own
+		block = gpuCreateBlock(kind, (size + alignment - 1) / alignment * alignment, memoryTypeBits, 1);
+		if(block == nil || !gpuBlockAlloc(block, size, alignment, &offset))
+			return 0;
+	}
+
+	alloc->block = block;
+	alloc->offset = offset;
+	alloc->size = size;
+	alloc->generation = vkGlobals.heapGeneration;
+	return 1;
+}
+
+static void
+gpuFree(VulkanAllocation *alloc)
+{
+	GpuBlock *block = (GpuBlock*)alloc->block;
+	if(block && alloc->generation == vkGlobals.heapGeneration){
+		gpuBlockFree(block, alloc->offset, alloc->size);
+		if(block->used == 0){
+			// Keep one empty shared block per heap around so streaming
+			// doesn't keep allocating and freeing the same memory.
+			GpuHeapKind kind = block->buffer != VK_NULL_HANDLE ? GPU_HEAP_BUFFER : GPU_HEAP_IMAGE;
+			bool32 release = block->dedicated;
+			if(!release)
+				for(GpuBlock *b = vkGlobals.heapBlocks[kind]; b; b = b->next)
+					if(b != block && !b->dedicated && b->used == 0){
+						release = 1;
+						break;
+					}
+			if(release){
+				GpuBlock **pp = &vkGlobals.heapBlocks[kind];
+				while(*pp && *pp != block)
+					pp = &(*pp)->next;
+				if(*pp)
+					*pp = block->next;
+				gpuDestroyBlock(block);
+			}
+		}
+	}
+	memset(alloc, 0, sizeof(*alloc));
+}
+
+static bool32
+gpuAllocValid(const VulkanAllocation *alloc)
+{
+	return alloc->block != nil && alloc->generation == vkGlobals.heapGeneration;
+}
+
+static void
+gpuDestroyHeaps(void)
+{
+	for(int kind = 0; kind < GPU_HEAP_COUNT; kind++){
+		GpuBlock *b = vkGlobals.heapBlocks[kind];
+		while(b){
+			GpuBlock *next = b->next;
+			gpuDestroyBlock(b);
+			b = next;
+		}
+		vkGlobals.heapBlocks[kind] = nil;
+	}
+	// invalidates every allocation still pointing into the old blocks
+	vkGlobals.heapGeneration++;
+}
+
 static bool32
 ensureBuffer(VulkanBuffer *buffer, VkDeviceSize size, VkBufferUsageFlags usage)
 {
@@ -591,30 +938,49 @@ alignDynamicOffset(VkDeviceSize offset, VkDeviceSize alignment)
 	return (offset + alignment - 1) & ~(alignment - 1);
 }
 
-static bool32
-uploadDynamicBuffer(VulkanBuffer *buffer, VkDeviceSize *cursor, const void *data,
+// Reserve space in a per-frame dynamic buffer and return a pointer to write to.
+// When the buffer is full, the old one stays alive until this frame retires
+// (the command buffer being recorded still points at it) and a bigger one
+// takes over; the old code waited for the device and freed it under the
+// recording command buffer's feet.
+static uint8*
+allocDynamicBuffer(VulkanBuffer *buffer, VkDeviceSize *cursor,
 	VkDeviceSize size, VkBufferUsageFlags usage, VkDeviceSize alignment, VkDeviceSize *offsetOut)
 {
 	VkDeviceSize offset = alignDynamicOffset(*cursor, alignment);
 	VkDeviceSize end = offset + size;
 
 	if(buffer->buffer == VK_NULL_HANDLE || buffer->capacity < end){
-		if(*cursor != 0){
-			Context *ctx = &vkGlobals.context;
-			if(ctx->device != VK_NULL_HANDLE)
-				vkDeviceWaitIdle(ctx->device);
-		}
+		Context *ctx = &vkGlobals.context;
 		VkDeviceSize newCap = buffer->capacity ? buffer->capacity * 2 : 16ull * 1024ull * 1024ull;
-		while(newCap < end)
+		while(newCap < size)
 			newCap *= 2;
-		if(!ensureBuffer(buffer, newCap, usage))
-			return 0;
+		if(buffer->buffer != VK_NULL_HANDLE){
+			FrameTextureUploadGarbage *garbage = &vkGlobals.textureUploadGarbage[ctx->currentFrame];
+			if(garbage->numRetiredBuffers >= nelem(garbage->retiredBuffers))
+				return nil;
+			garbage->retiredBuffers[garbage->numRetiredBuffers++] = *buffer;
+			memset(buffer, 0, sizeof(*buffer));
+		}
+		if(!createBuffer(buffer, newCap, usage))
+			return nil;
+		offset = 0;
+		end = size;
 	}
-
-	memcpy((uint8*)buffer->mapped + offset, data, (size_t)size);
 
 	*offsetOut = offset;
 	*cursor = end;
+	return (uint8*)buffer->mapped + offset;
+}
+
+static bool32
+uploadDynamicBuffer(VulkanBuffer *buffer, VkDeviceSize *cursor, const void *data,
+	VkDeviceSize size, VkBufferUsageFlags usage, VkDeviceSize alignment, VkDeviceSize *offsetOut)
+{
+	uint8 *dst = allocDynamicBuffer(buffer, cursor, size, usage, alignment, offsetOut);
+	if(dst == nil)
+		return 0;
+	memcpy(dst, data, (size_t)size);
 	return 1;
 }
 
@@ -1032,6 +1398,8 @@ getOrCreateSampler(VkSamplerAddressMode addressModeU, VkSamplerAddressMode addre
 	samplerInfo.addressModeV = addressModeV;
 	samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
 	samplerInfo.maxAnisotropy = 1.0f;
+	samplerInfo.minLod = 0.0f;
+	samplerInfo.maxLod = VK_LOD_CLAMP_NONE;	// was 0, which pinned sampling to level 0
 	samplerInfo.borderColor = borderColor;
 	samplerInfo.unnormalizedCoordinates = VK_FALSE;
 	VkSampler s = VK_NULL_HANDLE;
@@ -1185,8 +1553,99 @@ createTextureImage(uint32 width, uint32 height, const uint8 *rgba,
 }
 
 static bool32
-createTextureImageForFrame(uint32 width, uint32 height, const uint8 *rgba, VkCommandBuffer commandBuffer,
-	VulkanBuffer *stagingOut, VkImage *image, VkDeviceMemory *memory, VkImageView *view,
+isMipFilter(uint32 filter)
+{
+	return filter == Texture::MIPNEAREST || filter == Texture::MIPLINEAR ||
+	       filter == Texture::LINEARMIPNEAREST || filter == Texture::LINEARMIPLINEAR;
+}
+
+static uint32
+countMipLevels(uint32 width, uint32 height)
+{
+	uint32 n = 1;
+	while(width > 1 || height > 1){
+		width = width > 1 ? width/2 : 1;
+		height = height > 1 ? height/2 : 1;
+		n++;
+	}
+	return n;
+}
+
+static void
+imageLevelBarrier(VkCommandBuffer commandBuffer, VkImage image, uint32 baseLevel, uint32 levelCount,
+	VkImageLayout oldLayout, VkImageLayout newLayout, VkAccessFlags srcAccess, VkAccessFlags dstAccess,
+	VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage)
+{
+	VkImageMemoryBarrier barrier;
+	memset(&barrier, 0, sizeof(barrier));
+	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	barrier.oldLayout = oldLayout;
+	barrier.newLayout = newLayout;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image = image;
+	barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	barrier.subresourceRange.baseMipLevel = baseLevel;
+	barrier.subresourceRange.levelCount = levelCount;
+	barrier.subresourceRange.baseArrayLayer = 0;
+	barrier.subresourceRange.layerCount = 1;
+	barrier.srcAccessMask = srcAccess;
+	barrier.dstAccessMask = dstAccess;
+	vkCmdPipelineBarrier(commandBuffer, srcStage, dstStage, 0, 0, nil, 0, nil, 1, &barrier);
+}
+
+// Level 0 has been copied and every level is in TRANSFER_DST. Build the rest
+// of the chain with linear blits and leave everything shader readable.
+static void
+generateMipmaps(VkCommandBuffer commandBuffer, VkImage image, uint32 width, uint32 height, uint32 levels)
+{
+	int32 w = (int32)width, h = (int32)height;
+	for(uint32 i = 1; i < levels; i++){
+		imageLevelBarrier(commandBuffer, image, i-1, 1,
+			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+		int32 nw = w > 1 ? w/2 : 1;
+		int32 nh = h > 1 ? h/2 : 1;
+		VkImageBlit blit;
+		memset(&blit, 0, sizeof(blit));
+		blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		blit.srcSubresource.mipLevel = i-1;
+		blit.srcSubresource.layerCount = 1;
+		blit.srcOffsets[1].x = w;
+		blit.srcOffsets[1].y = h;
+		blit.srcOffsets[1].z = 1;
+		blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		blit.dstSubresource.mipLevel = i;
+		blit.dstSubresource.layerCount = 1;
+		blit.dstOffsets[1].x = nw;
+		blit.dstOffsets[1].y = nh;
+		blit.dstOffsets[1].z = 1;
+		vkCmdBlitImage(commandBuffer,
+			image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			1, &blit, VK_FILTER_LINEAR);
+
+		imageLevelBarrier(commandBuffer, image, i-1, 1,
+			VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+		w = nw;
+		h = nh;
+	}
+	imageLevelBarrier(commandBuffer, image, levels-1, 1,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+}
+
+// Record the creation of a sampled RGBA8 texture whose level 0 texels already
+// sit in stagingBuffer at stagingOffset. Memory comes from the image heap.
+static bool32
+createTextureImageForFrame(uint32 width, uint32 height, uint32 mipLevels, VkCommandBuffer commandBuffer,
+	VkBuffer stagingBuffer, VkDeviceSize stagingOffset,
+	VkImage *image, VulkanAllocation *alloc, VkImageView *view,
 	VkSampler *sampler, VkDescriptorSet *descriptorSet,
 	VkSamplerAddressMode addressModeU, VkSamplerAddressMode addressModeV,
 	VkFilter magFilter, VkFilter minFilter, VkSamplerMipmapMode mipmapMode)
@@ -1196,16 +1655,12 @@ createTextureImageForFrame(uint32 width, uint32 height, const uint8 *rgba, VkCom
 	   vkGlobals.textureSetLayout == VK_NULL_HANDLE || vkGlobals.descriptorPool == VK_NULL_HANDLE)
 		return 0;
 
-	memset(stagingOut, 0, sizeof(*stagingOut));
+	VkDeviceMemory noMemory = VK_NULL_HANDLE;
 	*image = VK_NULL_HANDLE;
-	*memory = VK_NULL_HANDLE;
+	memset(alloc, 0, sizeof(*alloc));
 	*view = VK_NULL_HANDLE;
 	*sampler = VK_NULL_HANDLE;
 	*descriptorSet = VK_NULL_HANDLE;
-
-	VkDeviceSize imageSize = (VkDeviceSize)width * height * 4;
-	if(!uploadBuffer(stagingOut, rgba, imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
-		return 0;
 
 	VkImageCreateInfo imageInfo;
 	memset(&imageInfo, 0, sizeof(imageInfo));
@@ -1214,47 +1669,31 @@ createTextureImageForFrame(uint32 width, uint32 height, const uint8 *rgba, VkCom
 	imageInfo.extent.width = width;
 	imageInfo.extent.height = height;
 	imageInfo.extent.depth = 1;
-	imageInfo.mipLevels = 1;
+	imageInfo.mipLevels = mipLevels;
 	imageInfo.arrayLayers = 1;
 	imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
 	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
 	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 	imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	if(mipLevels > 1)
+		imageInfo.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
 	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-	if(!vkOk(vkCreateImage(ctx->device, &imageInfo, nil, image), "vkCreateImage(frame texture)")){
-		destroyBuffer(stagingOut);
+	if(!vkOk(vkCreateImage(ctx->device, &imageInfo, nil, image), "vkCreateImage(frame texture)"))
 		return 0;
-	}
 
 	VkMemoryRequirements memRequirements;
 	vkGetImageMemoryRequirements(ctx->device, *image, &memRequirements);
-	VkMemoryAllocateInfo allocInfo;
-	memset(&allocInfo, 0, sizeof(allocInfo));
-	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-	allocInfo.allocationSize = memRequirements.size;
-	allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-	if(!vkOk(vkAllocateMemory(ctx->device, &allocInfo, nil, memory), "vkAllocateMemory(frame texture)") ||
-	   !vkOk(vkBindImageMemory(ctx->device, *image, *memory, 0), "vkBindImageMemory(frame texture)")){
-		destroyTextureHandles(image, memory, view, sampler);
-		destroyBuffer(stagingOut);
+	if(!gpuAlloc(GPU_HEAP_IMAGE, memRequirements.size, memRequirements.alignment,
+	             memRequirements.memoryTypeBits, alloc)){
+		destroyTextureHandles(image, &noMemory, alloc, view, sampler);
 		return 0;
 	}
-
-	transitionImageLayout(commandBuffer, *image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-	VkBufferImageCopy region;
-	memset(&region, 0, sizeof(region));
-	region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	region.imageSubresource.mipLevel = 0;
-	region.imageSubresource.baseArrayLayer = 0;
-	region.imageSubresource.layerCount = 1;
-	region.imageExtent.width = width;
-	region.imageExtent.height = height;
-	region.imageExtent.depth = 1;
-	vkCmdCopyBufferToImage(commandBuffer, stagingOut->buffer, *image,
-		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-	transitionImageLayout(commandBuffer, *image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	GpuBlock *block = (GpuBlock*)alloc->block;
+	if(!vkOk(vkBindImageMemory(ctx->device, *image, block->memory, alloc->offset), "vkBindImageMemory(frame texture)")){
+		destroyTextureHandles(image, &noMemory, alloc, view, sampler);
+		return 0;
+	}
 
 	VkImageViewCreateInfo viewInfo;
 	memset(&viewInfo, 0, sizeof(viewInfo));
@@ -1264,20 +1703,18 @@ createTextureImageForFrame(uint32 width, uint32 height, const uint8 *rgba, VkCom
 	viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
 	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 	viewInfo.subresourceRange.baseMipLevel = 0;
-	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.levelCount = mipLevels;
 	viewInfo.subresourceRange.baseArrayLayer = 0;
 	viewInfo.subresourceRange.layerCount = 1;
 	if(!vkOk(vkCreateImageView(ctx->device, &viewInfo, nil, view), "vkCreateImageView(frame texture)")){
-		destroyTextureHandles(image, memory, view, sampler);
-		destroyBuffer(stagingOut);
+		destroyTextureHandles(image, &noMemory, alloc, view, sampler);
 		return 0;
 	}
 
 	*sampler = getOrCreateSampler(addressModeU, addressModeV, magFilter, minFilter, mipmapMode,
 		VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK);
 	if(*sampler == VK_NULL_HANDLE){
-		destroyTextureHandles(image, memory, view, sampler);
-		destroyBuffer(stagingOut);
+		destroyTextureHandles(image, &noMemory, alloc, view, sampler);
 		return 0;
 	}
 
@@ -1289,8 +1726,7 @@ createTextureImageForFrame(uint32 width, uint32 height, const uint8 *rgba, VkCom
 	descAlloc.pSetLayouts = &vkGlobals.textureSetLayout;
 	if(!vkOk(vkAllocateDescriptorSets(ctx->device, &descAlloc, descriptorSet),
 	         "vkAllocateDescriptorSets(frame texture)")){
-		destroyTextureHandles(image, memory, view, sampler);
-		destroyBuffer(stagingOut);
+		destroyTextureHandles(image, &noMemory, alloc, view, sampler);
 		return 0;
 	}
 
@@ -1309,6 +1745,26 @@ createTextureImageForFrame(uint32 width, uint32 height, const uint8 *rgba, VkCom
 	write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 	write.pImageInfo = &imageDesc;
 	vkUpdateDescriptorSets(ctx->device, 1, &write, 0, nil);
+
+	// Everything that can fail is done, only now reference the image from
+	// the command buffer.
+	imageLevelBarrier(commandBuffer, *image, 0, mipLevels,
+		VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		0, VK_ACCESS_TRANSFER_WRITE_BIT,
+		VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	VkBufferImageCopy region;
+	memset(&region, 0, sizeof(region));
+	region.bufferOffset = stagingOffset;
+	region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	region.imageSubresource.mipLevel = 0;
+	region.imageSubresource.baseArrayLayer = 0;
+	region.imageSubresource.layerCount = 1;
+	region.imageExtent.width = width;
+	region.imageExtent.height = height;
+	region.imageExtent.depth = 1;
+	vkCmdCopyBufferToImage(commandBuffer, stagingBuffer, *image,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+	generateMipmaps(commandBuffer, *image, width, height, mipLevels);
 	return 1;
 }
 
@@ -1397,7 +1853,7 @@ createEmptySampledImage(uint32 width, uint32 height, VkFormat format, VkImageUsa
 }
 
 static void
-destroyTextureHandles(VkImage *image, VkDeviceMemory *memory, VkImageView *view, VkSampler *sampler)
+destroyTextureHandles(VkImage *image, VkDeviceMemory *memory, VulkanAllocation *alloc, VkImageView *view, VkSampler *sampler)
 {
 	Context *ctx = &vkGlobals.context;
 	if(ctx->device == VK_NULL_HANDLE)
@@ -1409,9 +1865,38 @@ destroyTextureHandles(VkImage *image, VkDeviceMemory *memory, VkImageView *view,
 		vkDestroyImage(ctx->device, *image, nil);
 	if(*memory != VK_NULL_HANDLE)
 		vkFreeMemory(ctx->device, *memory, nil);
+	if(alloc)
+		gpuFree(alloc);
 	*image = VK_NULL_HANDLE;
 	*memory = VK_NULL_HANDLE;
 	*view = VK_NULL_HANDLE;
+}
+
+// Hand a raster's image, memory and descriptor set to the current frame's
+// garbage; frames still in flight may be sampling them.
+static void
+retireRasterGpuTexture(VulkanRaster *natras)
+{
+	Context *ctx = &vkGlobals.context;
+	if(natras->image != VK_NULL_HANDLE || natras->imageMemory != VK_NULL_HANDLE ||
+	   gpuAllocValid(&natras->imageAlloc) || natras->imageView != VK_NULL_HANDLE ||
+	   natras->descriptorSet != VK_NULL_HANDLE){
+		if(!keepTextureGarbage(garbageFrame(), natras->image, natras->imageMemory, &natras->imageAlloc,
+			natras->imageView, natras->sampler, natras->descriptorSet)){
+			if(ctx->device != VK_NULL_HANDLE)
+				vkDeviceWaitIdle(ctx->device);
+			if(natras->descriptorSet != VK_NULL_HANDLE && vkGlobals.descriptorPool != VK_NULL_HANDLE)
+				vkFreeDescriptorSets(ctx->device, vkGlobals.descriptorPool, 1, &natras->descriptorSet);
+			destroyTextureHandles(&natras->image, &natras->imageMemory, &natras->imageAlloc,
+				&natras->imageView, &natras->sampler);
+		}
+	}
+	natras->image = VK_NULL_HANDLE;
+	natras->imageMemory = VK_NULL_HANDLE;
+	memset(&natras->imageAlloc, 0, sizeof(natras->imageAlloc));
+	natras->imageView = VK_NULL_HANDLE;
+	natras->sampler = VK_NULL_HANDLE;
+	natras->descriptorSet = VK_NULL_HANDLE;
 }
 
 void
@@ -1433,29 +1918,22 @@ destroyRasterTexture(Raster *raster)
 	}
 	removeTextureUploadGarbageForRaster(raster);
 	VulkanRaster *natras = GETVULKANRASTEREXT(raster);
-	if(natras->image != VK_NULL_HANDLE || natras->imageMemory != VK_NULL_HANDLE ||
-	   natras->imageView != VK_NULL_HANDLE || natras->sampler != VK_NULL_HANDLE){
-		Context *ctx = &vkGlobals.context;
-		if(!keepTextureGarbage(ctx->currentFrame, natras->image, natras->imageMemory, natras->imageView, natras->sampler)){
-			vkDeviceWaitIdle(ctx->device);
-			destroyTextureHandles(&natras->image, &natras->imageMemory, &natras->imageView, &natras->sampler);
-		}else{
-			natras->image = VK_NULL_HANDLE;
-			natras->imageMemory = VK_NULL_HANDLE;
-			natras->imageView = VK_NULL_HANDLE;
-			natras->sampler = VK_NULL_HANDLE;
-		}
-	}
-	if(natras->descriptorSet != VK_NULL_HANDLE && vkGlobals.descriptorPool != VK_NULL_HANDLE){
-		Context *ctx = &vkGlobals.context;
-		vkFreeDescriptorSets(ctx->device, vkGlobals.descriptorPool, 1, &natras->descriptorSet);
-	}
+	retireRasterGpuTexture(natras);
 	natras->descriptorSet = VK_NULL_HANDLE;
 	natras->imageFormat = VK_FORMAT_UNDEFINED;
 	natras->imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 	natras->gpuReady = 0;
 	natras->gpuDirty = 1;
 	natras->uploadSubmitted = 0;
+}
+
+// dst is usually mapped, write-combined staging memory: write every texel
+// with one 32 bit store and never read it back.
+static inline void
+storeTexel(uint8 *dst, uint8 r, uint8 g, uint8 b, uint8 a)
+{
+	uint8 px[4] = { r, g, b, a };
+	memcpy(dst, px, 4);
 }
 
 static void
@@ -1468,54 +1946,45 @@ convertRasterToRGBA(Raster *raster, uint8 *dst)
 
 	uint8 *src = levels->levels[0].data;
 	uint32 pixels = (uint32)levels->levels[0].width * levels->levels[0].height;
-	for(uint32 i = 0; i < pixels; i++){
-		if(natras->bpp == 4){
-			dst[0] = src[0];
-			dst[1] = src[1];
-			dst[2] = src[2];
-			dst[3] = src[3];
-			src += 4;
-		}else if(natras->bpp == 3){
-			dst[0] = src[0];
-			dst[1] = src[1];
-			dst[2] = src[2];
-			dst[3] = 255;
-			src += 3;
-		}else{
-			uint16 p = (uint16)(src[0] | (src[1] << 8));
-			switch(raster->format & 0xF00){
-			case Raster::C565:
-				dst[0] = (uint8)(((p >> 11) & 0x1F) * 255 / 31);
-				dst[1] = (uint8)(((p >> 5) & 0x3F) * 255 / 63);
-				dst[2] = (uint8)((p & 0x1F) * 255 / 31);
-				dst[3] = 255;
-				break;
-			case Raster::C555:
-				dst[0] = (uint8)(((p >> 10) & 0x1F) * 255 / 31);
-				dst[1] = (uint8)(((p >> 5) & 0x1F) * 255 / 31);
-				dst[2] = (uint8)((p & 0x1F) * 255 / 31);
-				dst[3] = 255;
-				break;
-			case Raster::C4444:
-				dst[0] = (uint8)(((p >> 8) & 0x0F) * 255 / 15);
-				dst[1] = (uint8)(((p >> 4) & 0x0F) * 255 / 15);
-				dst[2] = (uint8)((p & 0x0F) * 255 / 15);
-				dst[3] = (uint8)(((p >> 12) & 0x0F) * 255 / 15);
-				break;
-			case Raster::C1555:
-				dst[0] = (uint8)(((p >> 11) & 0x1F) * 255 / 31);
-				dst[1] = (uint8)((((p >> 6) & 0x03) | (((p >> 8) & 0x07) << 2)) * 255 / 31);
-				dst[2] = (uint8)(((p >> 1) & 0x1F) * 255 / 31);
-				dst[3] = (p & 0x0001) ? 255 : 0;
-				break;
-			default:
-				dst[0] = dst[1] = dst[2] = 255;
-				dst[3] = 255;
-				break;
-			}
-			src += 2;
+	if(natras->bpp == 4){
+		memcpy(dst, src, (size_t)pixels*4);
+		return;
+	}
+	if(natras->bpp == 3){
+		for(uint32 i = 0; i < pixels; i++, src += 3, dst += 4)
+			storeTexel(dst, src[0], src[1], src[2], 255);
+		return;
+	}
+	uint32 format = raster->format & 0xF00;
+	for(uint32 i = 0; i < pixels; i++, src += 2, dst += 4){
+		uint16 p = (uint16)(src[0] | (src[1] << 8));
+		switch(format){
+		case Raster::C565:
+			storeTexel(dst, (uint8)(((p >> 11) & 0x1F) * 255 / 31),
+				(uint8)(((p >> 5) & 0x3F) * 255 / 63),
+				(uint8)((p & 0x1F) * 255 / 31), 255);
+			break;
+		case Raster::C555:
+			storeTexel(dst, (uint8)(((p >> 10) & 0x1F) * 255 / 31),
+				(uint8)(((p >> 5) & 0x1F) * 255 / 31),
+				(uint8)((p & 0x1F) * 255 / 31), 255);
+			break;
+		case Raster::C4444:
+			storeTexel(dst, (uint8)(((p >> 8) & 0x0F) * 255 / 15),
+				(uint8)(((p >> 4) & 0x0F) * 255 / 15),
+				(uint8)((p & 0x0F) * 255 / 15),
+				(uint8)(((p >> 12) & 0x0F) * 255 / 15));
+			break;
+		case Raster::C1555:
+			storeTexel(dst, (uint8)(((p >> 11) & 0x1F) * 255 / 31),
+				(uint8)((((p >> 6) & 0x03) | (((p >> 8) & 0x07) << 2)) * 255 / 31),
+				(uint8)(((p >> 1) & 0x1F) * 255 / 31),
+				(p & 0x0001) ? 255 : 0);
+			break;
+		default:
+			storeTexel(dst, 255, 255, 255, 255);
+			break;
 		}
-		dst += 4;
 	}
 }
 
@@ -1533,38 +2002,73 @@ ensureTextureUploaded(Raster *raster)
 	return 0;
 }
 
-static bool32
-keepTextureGarbage(uint32 frame, VkImage image, VkDeviceMemory memory, VkImageView view, VkSampler sampler)
+// Which frame slot's garbage list a resource released right now belongs to.
+// A slot's list is emptied once that slot's fence has signalled. While a
+// frame is recorded that is its own slot. Between frames the frames still
+// running on the GPU are the previous ones, and the slot about to be reused
+// only waits for the oldest of them, so use the most recent frame's slot.
+static uint32
+garbageFrame(void)
 {
-	if(frame >= MAX_FRAMES_IN_FLIGHT)
-		return 0;
-	FrameTextureUploadGarbage *garbage = &vkGlobals.textureUploadGarbage[frame];
-	if(garbage->numTextures >= nelem(garbage->textures))
-		return 0;
+	Context *ctx = &vkGlobals.context;
+	if(ctx->frameStarted)
+		return ctx->currentFrame;
+	return (ctx->currentFrame + MAX_FRAMES_IN_FLIGHT - 1) % MAX_FRAMES_IN_FLIGHT;
+}
 
-	garbage->textures[garbage->numTextures].image = image;
-	garbage->textures[garbage->numTextures].memory = memory;
-	garbage->textures[garbage->numTextures].view = view;
-	garbage->textures[garbage->numTextures].sampler = sampler;
-	garbage->numTextures++;
+template <typename T> static bool32
+growGarbageList(T **list, uint32 count, uint32 *capacity)
+{
+	if(count < *capacity)
+		return 1;
+	uint32 newCapacity = *capacity ? *capacity*2 : 256;
+	T *newList = rwNewT(T, newCapacity, MEMDUR_EVENT | ID_DRIVER);
+	if(newList == nil)
+		return 0;
+	if(*list){
+		memcpy(newList, *list, sizeof(T)*count);
+		rwFree(*list);
+	}
+	*list = newList;
+	*capacity = newCapacity;
 	return 1;
 }
 
 static bool32
-keepGeometryGarbage(uint32 frame, VkBuffer vertexBuffer, VkDeviceMemory vertexBufferMemory,
-	VkBuffer indexBuffer, VkDeviceMemory indexBufferMemory)
+keepTextureGarbage(uint32 frame, VkImage image, VkDeviceMemory memory, VulkanAllocation *alloc,
+	VkImageView view, VkSampler sampler, VkDescriptorSet descriptorSet)
 {
 	if(frame >= MAX_FRAMES_IN_FLIGHT)
 		return 0;
 	FrameTextureUploadGarbage *garbage = &vkGlobals.textureUploadGarbage[frame];
-	if(garbage->numGeometries >= nelem(garbage->geometries))
+	if(!growGarbageList(&garbage->textures, garbage->numTextures, &garbage->textureCapacity))
 		return 0;
 
-	garbage->geometries[garbage->numGeometries].vertexBuffer = vertexBuffer;
-	garbage->geometries[garbage->numGeometries].vertexBufferMemory = vertexBufferMemory;
-	garbage->geometries[garbage->numGeometries].indexBuffer = indexBuffer;
-	garbage->geometries[garbage->numGeometries].indexBufferMemory = indexBufferMemory;
-	garbage->numGeometries++;
+	TextureGarbage *t = &garbage->textures[garbage->numTextures++];
+	t->image = image;
+	t->memory = memory;
+	if(alloc){
+		t->alloc = *alloc;
+		memset(alloc, 0, sizeof(*alloc));
+	}else
+		memset(&t->alloc, 0, sizeof(t->alloc));
+	t->view = view;
+	t->sampler = sampler;
+	t->descriptorSet = descriptorSet;
+	return 1;
+}
+
+static bool32
+keepGeometryGarbage(uint32 frame, VulkanAllocation *alloc)
+{
+	if(frame >= MAX_FRAMES_IN_FLIGHT)
+		return 0;
+	FrameTextureUploadGarbage *garbage = &vkGlobals.textureUploadGarbage[frame];
+	if(!growGarbageList(&garbage->geometries, garbage->numGeometries, &garbage->geometryCapacity))
+		return 0;
+
+	garbage->geometries[garbage->numGeometries++].alloc = *alloc;
+	memset(alloc, 0, sizeof(*alloc));
 	return 1;
 }
 
@@ -1586,23 +2090,22 @@ retireTextureUploadGarbage(uint32 frame)
 	garbage->numStaging = 0;
 
 	for(uint32 i = 0; i < garbage->numTextures; i++){
+		if(garbage->textures[i].descriptorSet != VK_NULL_HANDLE &&
+		   vkGlobals.descriptorPool != VK_NULL_HANDLE && vkGlobals.context.device != VK_NULL_HANDLE)
+			vkFreeDescriptorSets(vkGlobals.context.device, vkGlobals.descriptorPool, 1,
+				&garbage->textures[i].descriptorSet);
 		destroyTextureHandles(&garbage->textures[i].image, &garbage->textures[i].memory,
-			&garbage->textures[i].view, &garbage->textures[i].sampler);
+			&garbage->textures[i].alloc, &garbage->textures[i].view, &garbage->textures[i].sampler);
 	}
 	garbage->numTextures = 0;
 
-	for(uint32 i = 0; i < garbage->numGeometries; i++){
-		Context *ctx = &vkGlobals.context;
-		if(garbage->geometries[i].vertexBuffer != VK_NULL_HANDLE)
-			vkDestroyBuffer(ctx->device, garbage->geometries[i].vertexBuffer, nil);
-		if(garbage->geometries[i].vertexBufferMemory != VK_NULL_HANDLE)
-			vkFreeMemory(ctx->device, garbage->geometries[i].vertexBufferMemory, nil);
-		if(garbage->geometries[i].indexBuffer != VK_NULL_HANDLE)
-			vkDestroyBuffer(ctx->device, garbage->geometries[i].indexBuffer, nil);
-		if(garbage->geometries[i].indexBufferMemory != VK_NULL_HANDLE)
-			vkFreeMemory(ctx->device, garbage->geometries[i].indexBufferMemory, nil);
-	}
+	for(uint32 i = 0; i < garbage->numGeometries; i++)
+		gpuFree(&garbage->geometries[i].alloc);
 	garbage->numGeometries = 0;
+
+	for(uint32 i = 0; i < garbage->numRetiredBuffers; i++)
+		destroyBuffer(&garbage->retiredBuffers[i]);
+	garbage->numRetiredBuffers = 0;
 }
 
 
@@ -1614,7 +2117,7 @@ removeTextureUploadGarbageForRaster(Raster *raster)
 	for(uint32 frame = 0; frame < MAX_FRAMES_IN_FLIGHT; frame++){
 		FrameTextureUploadGarbage *garbage = &vkGlobals.textureUploadGarbage[frame];
 		for(uint32 i = 0; i < garbage->numStaging; i++)
-			if(garbage->raster[i] == raster)
+			if(garbage->raster[i] == raster && garbage->staging[i].buffer != VK_NULL_HANDLE)
 				found = 1;
 	}
 	if(found && ctx->device != VK_NULL_HANDLE)
@@ -1642,9 +2145,19 @@ removeTextureUploadGarbageForRaster(Raster *raster)
 static void
 destroyTextureUploadResources(void)
 {
-	for(uint32 frame = 0; frame < MAX_FRAMES_IN_FLIGHT; frame++)
+	for(uint32 frame = 0; frame < MAX_FRAMES_IN_FLIGHT; frame++){
 		retireTextureUploadGarbage(frame);
+		FrameTextureUploadGarbage *garbage = &vkGlobals.textureUploadGarbage[frame];
+		rwFree(garbage->textures);
+		garbage->textures = nil;
+		garbage->textureCapacity = 0;
+		rwFree(garbage->geometries);
+		garbage->geometries = nil;
+		garbage->geometryCapacity = 0;
+		destroyBuffer(&vkGlobals.uploadStaging[frame]);
+	}
 	vkGlobals.numPendingTextureUploads = 0;
+	vkGlobals.uploadStagingOffset = 0;
 }
 
 static bool32
@@ -1672,6 +2185,27 @@ uploadElapsedUsecs(uint64 startCounter)
 	return (SDL_GetPerformanceCounter() - startCounter) * 1000000ull / frequency;
 }
 
+// Space for this frame's texture uploads in a persistently mapped ring
+// buffer, so uploads don't create and free a staging buffer each.
+static uint8*
+allocUploadStaging(VkDeviceSize size, VkBuffer *buffer, VkDeviceSize *offset)
+{
+	Context *ctx = &vkGlobals.context;
+	VulkanBuffer *ring = &vkGlobals.uploadStaging[ctx->currentFrame];
+	if(size > TEXTURE_UPLOAD_BYTES_PER_FRAME)
+		return nil;
+	if(ring->buffer == VK_NULL_HANDLE &&
+	   !createBuffer(ring, TEXTURE_UPLOAD_BYTES_PER_FRAME, VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
+		return nil;
+	VkDeviceSize start = alignDynamicOffset(vkGlobals.uploadStagingOffset, 256);
+	if(start + size > ring->capacity)
+		return nil;
+	vkGlobals.uploadStagingOffset = start + size;
+	*buffer = ring->buffer;
+	*offset = start;
+	return (uint8*)ring->mapped + start;
+}
+
 static bool32
 uploadTextureForFrame(Raster *raster, VkCommandBuffer commandBuffer, VkDeviceSize *uploadedBytes)
 {
@@ -1696,26 +2230,27 @@ uploadTextureForFrame(Raster *raster, VkCommandBuffer commandBuffer, VkDeviceSiz
 	int32 height = natras->levels->levels[0].height;
 	if(width <= 0 || height <= 0)
 		return 1;
+	VkDeviceSize imageSize = (VkDeviceSize)width * height * 4;
 
-	uint8 *rgba = rwNewT(uint8, (uint32)width * height * 4, MEMDUR_FUNCTION | ID_DRIVER);
-	if(rgba == nil)
-		return 0;
-	convertRasterToRGBA(raster, rgba);
+	// Stage the texels, converting straight into mapped memory. Textures
+	// too big for the ring get a staging buffer of their own.
+	VulkanBuffer dedicated;
+	memset(&dedicated, 0, sizeof(dedicated));
+	VkBuffer stagingBuffer = VK_NULL_HANDLE;
+	VkDeviceSize stagingOffset = 0;
+	uint8 *staging = allocUploadStaging(imageSize, &stagingBuffer, &stagingOffset);
+	if(staging == nil){
+		if(imageSize <= TEXTURE_UPLOAD_BYTES_PER_FRAME)
+			return 0;	// ring is full this frame, try again next one
+		if(!createBuffer(&dedicated, imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
+			return 0;
+		staging = (uint8*)dedicated.mapped;
+		stagingBuffer = dedicated.buffer;
+	}
+	convertRasterToRGBA(raster, staging);
 
 	removeTextureUploadGarbageForRaster(raster);
-	if(natras->image != VK_NULL_HANDLE || natras->imageMemory != VK_NULL_HANDLE ||
-	   natras->imageView != VK_NULL_HANDLE || natras->sampler != VK_NULL_HANDLE){
-		if(!keepTextureGarbage(ctx->currentFrame, natras->image, natras->imageMemory, natras->imageView, natras->sampler)){
-			vkDeviceWaitIdle(ctx->device);
-			destroyTextureHandles(&natras->image, &natras->imageMemory, &natras->imageView, &natras->sampler);
-		}else{
-			natras->image = VK_NULL_HANDLE;
-			natras->imageMemory = VK_NULL_HANDLE;
-			natras->imageView = VK_NULL_HANDLE;
-			natras->sampler = VK_NULL_HANDLE;
-		}
-	}
-	natras->descriptorSet = VK_NULL_HANDLE;
+	retireRasterGpuTexture(natras);
 	natras->imageFormat = VK_FORMAT_UNDEFINED;
 	natras->imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -1725,23 +2260,34 @@ uploadTextureForFrame(Raster *raster, VkCommandBuffer commandBuffer, VkDeviceSiz
 	VkFilter magF = VK_FILTER_LINEAR;
 	VkFilter minF = VK_FILTER_LINEAR;
 	VkSamplerMipmapMode mipM = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+	bool32 wantMips;
 
 	if(tex != nil){
 		addrModeU = vulkanAddressMode(tex->getAddressU());
 		addrModeV = vulkanAddressMode(tex->getAddressV());
 		vulkanFilterMode(tex->getFilter(), &magF, &minF, &mipM);
-	}
+		wantMips = isMipFilter(tex->getFilter());
+	}else
+		wantMips = (raster->format & Raster::MIPMAP) != 0;
 
-	VulkanBuffer staging;
-	bool32 ok = createTextureImageForFrame((uint32)width, (uint32)height, rgba, commandBuffer, &staging,
-		&natras->image, &natras->imageMemory, &natras->imageView, &natras->sampler, &natras->descriptorSet,
+	// Without mipmaps every distant surface samples its full size texture,
+	// which thrashes the texture cache and burns memory bandwidth.
+	uint32 mipLevels = 1;
+	if(wantMips && vkGlobals.mipmapBlitSupported)
+		mipLevels = countMipLevels((uint32)width, (uint32)height);
+
+	bool32 ok = createTextureImageForFrame((uint32)width, (uint32)height, mipLevels, commandBuffer,
+		stagingBuffer, stagingOffset,
+		&natras->image, &natras->imageAlloc, &natras->imageView, &natras->sampler, &natras->descriptorSet,
 		addrModeU, addrModeV, magF, minF, mipM);
-	rwFree(rgba);
-	if(ok && !keepTextureUploadStaging(ctx->currentFrame, raster, &staging)){
-		destroyTextureHandles(&natras->image, &natras->imageMemory, &natras->imageView, &natras->sampler);
-		natras->descriptorSet = VK_NULL_HANDLE;
-		destroyBuffer(&staging);
-		ok = 0;
+	if(dedicated.buffer != VK_NULL_HANDLE){
+		if(ok && !keepTextureUploadStaging(ctx->currentFrame, raster, &dedicated)){
+			// can't keep the staging buffer alive until the copy ran
+			retireRasterGpuTexture(natras);
+			ok = 0;
+		}
+		if(!ok)
+			destroyBuffer(&dedicated);
 	}
 	natras->gpuReady = ok;
 	natras->gpuDirty = !ok;
@@ -1749,7 +2295,7 @@ uploadTextureForFrame(Raster *raster, VkCommandBuffer commandBuffer, VkDeviceSiz
 	natras->imageFormat = ok ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_UNDEFINED;
 	natras->imageLayout = ok ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
 	if(ok && uploadedBytes)
-		*uploadedBytes = (VkDeviceSize)width * height * 4;
+		*uploadedBytes = imageSize;
 	return ok;
 }
 
@@ -1893,7 +2439,9 @@ static void
 makeViewProj(RawMatrix *out)
 {
 	Camera *cam = (Camera*)engine->currentCamera;
-	if(cam)
+	if(cam && cam == vkGlobals.viewProjCamera)
+		*out = vkGlobals.camViewProj;	// computed once in beginUpdate
+	else if(cam)
 		RawMatrix::mult(out, &cam->devView, &cam->devProj);
 	else{
 		RawMatrix v, p;
@@ -2227,6 +2775,7 @@ selectLit3DPipelineKind(void)
 
 static bool32 createDrawPipelines(void);
 static void destroyDrawPipelines(void);
+static void resetCommandBindings(void);
 static void destroyDrawResources(void);
 static void destroyInstanceGpuBuffers(InstanceDataHeader *header);
 
@@ -2579,8 +3128,10 @@ createPipelineCache(void)
 	return ok;
 }
 
+// Android usually kills the app instead of shutting it down, so the cache is
+// written as soon as the pipelines exist rather than only at teardown.
 static void
-destroyPipelineCache(void)
+savePipelineCache(void)
 {
 	Context *ctx = &vkGlobals.context;
 	if(ctx->pipelineCache == VK_NULL_HANDLE)
@@ -2601,7 +3152,15 @@ destroyPipelineCache(void)
 			rwFree(data);
 		}
 	}
+}
 
+static void
+destroyPipelineCache(void)
+{
+	Context *ctx = &vkGlobals.context;
+	if(ctx->pipelineCache == VK_NULL_HANDLE)
+		return;
+	savePipelineCache();
 	vkDestroyPipelineCache(ctx->device, ctx->pipelineCache, nil);
 	ctx->pipelineCache = VK_NULL_HANDLE;
 }
@@ -2912,7 +3471,27 @@ createDrawPipelines(void)
 	vkDestroyShaderModule(ctx->device, shMatfxVert, nil);
 	vkDestroyShaderModule(ctx->device, shMatfxFrag, nil);
 
+	if(buildOk){
+		vkGlobals.pipelineColorFormat = ctx->swapchainFormat;
+		vkGlobals.pipelineDepthFormat = ctx->depthFormat;
+		savePipelineCache();
+	}
 	return buildOk;
+}
+
+// Pipelines only need a compatible render pass, i.e. the same attachment
+// formats. Recreating the swapchain (rotation, returning from background)
+// used to throw away and rebuild every pipeline, a long hitch on phones.
+static bool32
+ensureDrawPipelines(void)
+{
+	Context *ctx = &vkGlobals.context;
+	if(vkGlobals.pipelineLayouts[PIPE_IM2D] != VK_NULL_HANDLE &&
+	   vkGlobals.pipelineColorFormat == ctx->swapchainFormat &&
+	   vkGlobals.pipelineDepthFormat == ctx->depthFormat)
+		return 1;
+	destroyDrawPipelines();
+	return createDrawPipelines();
 }
 
 static void
@@ -2935,11 +3514,20 @@ destroyDrawPipelines(void)
 			vkGlobals.pipelineLayouts[k] = VK_NULL_HANDLE;
 		}
 	}
+	vkGlobals.pipelineColorFormat = VK_FORMAT_UNDEFINED;
+	vkGlobals.pipelineDepthFormat = VK_FORMAT_UNDEFINED;
+	resetCommandBindings();
 }
 
 static bool32
 createDrawResources(void)
 {
+	VkFormatProperties rgbaProps;
+	vkGetPhysicalDeviceFormatProperties(vkGlobals.context.physicalDevice, VK_FORMAT_R8G8B8A8_UNORM, &rgbaProps);
+	VkFormatFeatureFlags blitFeatures = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+		VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+	vkGlobals.mipmapBlitSupported = (rgbaProps.optimalTilingFeatures & blitFeatures) == blitFeatures;
+
 	if(!createTextureDescriptors())
 		return 0;
 	if(vkGlobals.rayTracingUserEnabled && vkGlobals.context.rayQueryEnabled)
@@ -2974,6 +3562,11 @@ destroyDrawResources(void)
 		return;
 	destroyDrawPipelines();
 	destroyPipelineCache();
+	// release the GPU buffers of all instanced geometries; the CPU side
+	// stays so they can be instanced again if the device comes back.
+	// They go through the frame garbage, which is emptied right after.
+	for(InstanceDataHeader *h = vkGlobals.instanceList; h; h = h->nextInst)
+		destroyInstanceGpuBuffers(h);
 	destroyTextureUploadResources();
 	for(int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++){
 		destroyBuffer(&vkGlobals.dynamicVertexBuffers[i]);
@@ -2985,11 +3578,7 @@ destroyDrawResources(void)
 	vkGlobals.dynamicVertexOffset = 0;
 	vkGlobals.dynamicIndexOffset = 0;
 	vkGlobals.litUniformOffset = 0;
-	// release the GPU buffers of all instanced geometries; the CPU side
-	// stays so they can be instanced again if the device comes back
-	for(InstanceDataHeader *h = vkGlobals.instanceList; h; h = h->nextInst)
-		destroyInstanceGpuBuffers(h);
-	destroyTextureHandles(&vkGlobals.whiteImage, &vkGlobals.whiteImageMemory,
+	destroyTextureHandles(&vkGlobals.whiteImage, &vkGlobals.whiteImageMemory, nil,
 		&vkGlobals.whiteImageView, &vkGlobals.whiteSampler);
 	vkGlobals.whiteDescriptorSet = VK_NULL_HANDLE;
 	destroyRayResources();
@@ -3020,6 +3609,8 @@ destroyDrawResources(void)
 	vkGlobals.tempBaseColors = nil;
 	rwFree(vkGlobals.tempDiffuse);
 	vkGlobals.tempDiffuse = nil;
+	gpuDestroyHeaps();
+	vkGlobals.memPropertiesValid = 0;
 }
 
 static void
@@ -3267,7 +3858,12 @@ createInstance(void)
 		return 0;
 	}
 
-	bool32 enableValidation = hasValidationLayer();
+	// Validation makes every Vulkan call several times slower. It used to be
+	// switched on whenever the layer was installed (any PC with the Vulkan
+	// SDK), so now it has to be asked for with LIBRW_VULKAN_VALIDATION=1.
+	const char *validationEnv = SDL_getenv("LIBRW_VULKAN_VALIDATION");
+	bool32 enableValidation = validationEnv && validationEnv[0] && validationEnv[0] != '0' &&
+		hasValidationLayer();
 
 	uint32 totalExtCount = sdlExtCount;
 	if(enableValidation)
@@ -4187,9 +4783,8 @@ recreateSwapchain(void)
 {
 	Context *ctx = &vkGlobals.context;
 	vkDeviceWaitIdle(ctx->device);
-	destroyDrawPipelines();
 	destroySwapchain();
-	return createSwapchain() && createDrawPipelines();
+	return createSwapchain() && ensureDrawPipelines();
 }
 
 // Android throws the ANativeWindow away when the app goes to the background, so
@@ -4202,7 +4797,6 @@ recreateSurface(void)
 	Context *ctx = &vkGlobals.context;
 	if(ctx->device != VK_NULL_HANDLE)
 		vkDeviceWaitIdle(ctx->device);
-	destroyDrawPipelines();
 	destroySwapchain();
 	if(ctx->surface != VK_NULL_HANDLE){
 		vkDestroySurfaceKHR(ctx->instance, ctx->surface, nil);
@@ -4210,7 +4804,7 @@ recreateSurface(void)
 	}
 	if(!createSurface())
 		return 0;
-	return createSwapchain() && createDrawPipelines();
+	return createSwapchain() && ensureDrawPipelines();
 }
 
 void
@@ -4458,6 +5052,17 @@ beginFrame(void)
 
 	vkWaitForFences(ctx->device, 1, &ctx->inFlight[ctx->currentFrame], VK_TRUE, UINT64_MAX);
 	retireTextureUploadGarbage(ctx->currentFrame);
+	vkGlobals.uploadStagingOffset = 0;
+
+	// The lit uniform buffer ran out last time this frame slot was used.
+	// Its descriptor set can only be repointed now that the slot is idle.
+	if(vkGlobals.litUniformOverflow[ctx->currentFrame]){
+		VulkanBuffer *ubo = &vkGlobals.litUniformBuffers[ctx->currentFrame];
+		VkDeviceSize newSize = ubo->capacity ? ubo->capacity*2 : DYNAMIC_LIT_UNIFORM_BUFFER_SIZE;
+		destroyBuffer(ubo);
+		createBuffer(ubo, newSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+		vkGlobals.litUniformOverflow[ctx->currentFrame] = 0;
+	}
 
 	VkResult result = vkAcquireNextImageKHR(ctx->device, ctx->swapchain, UINT64_MAX,
 		ctx->imageAvailable[ctx->currentFrame], VK_NULL_HANDLE, &ctx->currentImage);
@@ -4572,6 +5177,8 @@ beginUpdate(Camera *cam)
 	memcpy(&cam->devProj, &proj, sizeof(RawMatrix));
 	memcpy(vkGlobals.proj, proj, sizeof(proj));
 	multiplyMat4(vkGlobals.viewProj, proj, view);
+	RawMatrix::mult(&vkGlobals.camViewProj, &cam->devView, &cam->devProj);
+	vkGlobals.viewProjCamera = cam;
 
 	engine->currentCamera = cam;
 	if(cam->frameBuffer && cam->frameBuffer->type == Raster::CAMERATEXTURE)
@@ -5342,49 +5949,26 @@ findMinVertAndNumVertices(uint16 *indices, uint32 numIndices, uint32 *minVert, i
 	*numVertices = max - min + 1;
 }
 
-static bool32
-createStaticGpuBuffer(VkBuffer *buffer, VkDeviceMemory *memory, const void *data,
-	VkDeviceSize size, VkBufferUsageFlags usage)
-{
-	*buffer = VK_NULL_HANDLE;
-	*memory = VK_NULL_HANDLE;
-	if(size == 0 || data == nil || vkGlobals.context.device == VK_NULL_HANDLE)
-		return 0;
-
-	VulkanBuffer dst;
-	if(!createRawBuffer(&dst, size, usage,
-	   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1, 0)){
-		return 0;
-	}
-	memcpy(dst.mapped, data, (size_t)size);
-
-	*buffer = dst.buffer;
-	*memory = dst.memory;
-	return 1;
-}
-
 static void
 destroyInstanceGpuBuffers(InstanceDataHeader *header)
 {
 	Context *ctx = &vkGlobals.context;
-	if(ctx->device != VK_NULL_HANDLE &&
-	   (header->vertexBuffer != VK_NULL_HANDLE || header->indexBuffer != VK_NULL_HANDLE)){
-		if(!keepGeometryGarbage(ctx->currentFrame, header->vertexBuffer, header->vertexBufferMemory,
-			header->indexBuffer, header->indexBufferMemory)){
-			if(header->vertexBuffer != VK_NULL_HANDLE)
-				vkDestroyBuffer(ctx->device, header->vertexBuffer, nil);
-			if(header->vertexBufferMemory != VK_NULL_HANDLE)
-				vkFreeMemory(ctx->device, header->vertexBufferMemory, nil);
-			if(header->indexBuffer != VK_NULL_HANDLE)
-				vkDestroyBuffer(ctx->device, header->indexBuffer, nil);
-			if(header->indexBufferMemory != VK_NULL_HANDLE)
-				vkFreeMemory(ctx->device, header->indexBufferMemory, nil);
+	if(gpuAllocValid(&header->bufferAlloc)){
+		// Frames in flight, including the one being recorded, may still
+		// draw from this range, so it's only released once they retire.
+		if(!keepGeometryGarbage(garbageFrame(), &header->bufferAlloc)){
+			if(ctx->device != VK_NULL_HANDLE)
+				vkDeviceWaitIdle(ctx->device);
+			gpuFree(&header->bufferAlloc);
 		}
 	}
+	memset(&header->bufferAlloc, 0, sizeof(header->bufferAlloc));
 	header->vertexBuffer = VK_NULL_HANDLE;
 	header->vertexBufferMemory = VK_NULL_HANDLE;
 	header->indexBuffer = VK_NULL_HANDLE;
 	header->indexBufferMemory = VK_NULL_HANDLE;
+	header->vertexOffset = 0;
+	header->indexOffset = 0;
 	header->gpuDirty = 1;
 }
 
@@ -5416,20 +6000,29 @@ ensureInstanceBuffers(InstanceDataHeader *header)
 {
 	if(header == nil)
 		return 0;
-	if(header->isSkinned)
-		return 1; // Skinned geometries use dynamic buffers per frame; zero static VRAM allocations!
-	if(header->vertexBuffer != VK_NULL_HANDLE && header->indexBuffer != VK_NULL_HANDLE &&
-	   !header->gpuDirty)
+	if(gpuAllocValid(&header->bufferAlloc) && !header->gpuDirty)
 		return 1;
+	if(vkGlobals.context.device == VK_NULL_HANDLE || header->vertices == nil || header->indices == nil)
+		return 0;
 	destroyInstanceGpuBuffers(header);
-	if(!createStaticGpuBuffer(&header->vertexBuffer, &header->vertexBufferMemory, header->vertices,
-	   header->totalNumVertex*sizeof(Im3DVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT))
+
+	// Skinned geometry streams its vertices every frame but still keeps its
+	// indices here instead of re-uploading them per mesh per frame. Its bind
+	// pose is kept too so the default pipeline can draw it as well.
+	VkDeviceSize vertexSize = (VkDeviceSize)header->totalNumVertex*sizeof(Im3DVertex);
+	VkDeviceSize indexStart = (vertexSize + 3) & ~(VkDeviceSize)3;
+	VkDeviceSize indexSize = (VkDeviceSize)header->totalNumIndex*sizeof(uint16);
+	if(!gpuAlloc(GPU_HEAP_BUFFER, indexStart + indexSize, GPU_BUFFER_ALIGNMENT, 0xFFFFFFFF, &header->bufferAlloc))
 		return 0;
-	if(!createStaticGpuBuffer(&header->indexBuffer, &header->indexBufferMemory, header->indices,
-	   header->totalNumIndex*sizeof(uint16), VK_BUFFER_USAGE_INDEX_BUFFER_BIT)){
-		destroyInstanceGpuBuffers(header);
-		return 0;
-	}
+	GpuBlock *block = (GpuBlock*)header->bufferAlloc.block;
+	uint8 *dst = block->mapped + header->bufferAlloc.offset;
+	memcpy(dst, header->vertices, (size_t)vertexSize);
+	memcpy(dst + indexStart, header->indices, (size_t)indexSize);
+
+	header->vertexBuffer = block->buffer;
+	header->indexBuffer = block->buffer;
+	header->vertexOffset = header->bufferAlloc.offset;
+	header->indexOffset = header->bufferAlloc.offset + indexStart;
 	header->gpuDirty = 0;
 	return 1;
 }
@@ -5551,6 +6144,7 @@ defaultInstanceCB(Geometry *geo, InstanceDataHeader *header)
 	}
 
 	InstanceData *inst = header->inst;
+	header->anyVertexAlpha = 0;
 	for(uint32 i = 0; i < header->numMeshes; i++){
 		inst->vertexAlpha = 0;
 		uint32 end = inst->minVert + inst->numVertices;
@@ -5559,6 +6153,7 @@ defaultInstanceCB(Geometry *geo, InstanceDataHeader *header)
 		for(uint32 j = inst->minVert; j < end; j++)
 			if(header->vertices[j].a != 0xFF){
 				inst->vertexAlpha = 1;
+				header->anyVertexAlpha = 1;
 				break;
 			}
 		inst++;
@@ -5621,6 +6216,24 @@ ensureLitUniformResources(void)
 		vkUpdateDescriptorSets(ctx->device, 1, &write, 0, nil);
 		vkGlobals.litDescriptorBuffers[ctx->currentFrame] = buffer->buffer;
 	}
+	return 1;
+}
+
+static bool32
+uploadLitUniforms(const Lit3DUniforms *u, uint32 *dynamicOffset)
+{
+	Context *ctx = &vkGlobals.context;
+	VulkanBuffer *buffer = &vkGlobals.litUniformBuffers[ctx->currentFrame];
+	VkDeviceSize offset = alignDynamicOffset(vkGlobals.litUniformOffset, vkGlobals.uboAlignment);
+	if(buffer->buffer == VK_NULL_HANDLE || offset + sizeof(*u) > buffer->capacity){
+		// The frame's descriptor set points at this buffer, so a bigger one
+		// can only replace it when this frame slot comes around again.
+		vkGlobals.litUniformOverflow[ctx->currentFrame] = 1;
+		return 0;
+	}
+	memcpy((uint8*)buffer->mapped + offset, u, sizeof(*u));
+	vkGlobals.litUniformOffset = offset + sizeof(*u);
+	*dynamicOffset = (uint32)offset;
 	return 1;
 }
 
@@ -5874,6 +6487,78 @@ cpuDefaultRenderCB(Atomic *atomic)
 	}
 }
 
+// Draw every mesh of an instanced atomic with a lit3d pipeline. Vertex and
+// index buffers and the atomic's uniforms are already bound; only material
+// state changes per mesh, and render states can't change in between, so the
+// two possible pipelines and alpha test values are looked up once.
+static void
+drawLitMeshes(VkCommandBuffer cmd, Geometry *geo, InstanceDataHeader *header,
+	PipelineKind k, PrimitiveType primType, Lit3DPush *p)
+{
+	RGBA white = { 255, 255, 255, 255 };
+	static const SurfaceProperties defaultSurfProps = { 1.0f, 0.0f, 1.0f };
+	bool32 vertexAlphaState = getRenderStateUInt(VERTEXALPHA, 0) != 0;
+	VkPipeline opaquePipeline = getDrawPipeline(k, primType, 0);
+	VkPipeline alphaPipeline = getDrawPipeline(k, primType, 1);
+	float alphaRefOff[4], alphaRefOn[4];
+	makeAlphaRef(alphaRefOff, 0);
+	makeAlphaRef(alphaRefOn, 1);
+	bool32 modulate = (geo->flags & Geometry::MODULATE) != 0;
+
+	for(uint32 i = 0; i < header->numMeshes; i++){
+		InstanceData *inst = &header->inst[i];
+		if(inst->numIndex == 0)
+			continue;
+		Material *mat = inst->material;
+		RGBA matColor = white;
+		const SurfaceProperties *surf = &defaultSurfProps;
+		VkDescriptorSet tex = vkGlobals.whiteDescriptorSet;
+		Raster *texRaster = nil;
+		if(mat){
+			if(modulate)
+				matColor = mat->color;
+			surf = &mat->surfaceProps;
+			if(mat->texture && mat->texture->raster){
+				texRaster = mat->texture->raster;
+				tex = getTextureDescriptor(texRaster);
+			}
+		}
+
+		bool32 alpha = inst->vertexAlpha || matColor.alpha != 0xFF ||
+			vertexAlphaState || rasterHasAlpha(texRaster);
+		VkPipeline pipeline = alpha ? alphaPipeline : opaquePipeline;
+		if(vkGlobals.currentPipeline != pipeline){
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+			vkGlobals.currentPipeline = pipeline;
+		}
+
+		colorToFloat(p->matColor, matColor);
+		p->surfProps[0] = surf->ambient;
+		p->surfProps[1] = surf->diffuse;
+		memcpy(p->alphaRef, alpha ? alphaRefOn : alphaRefOff, sizeof(p->alphaRef));
+		vkCmdPushConstants(cmd, vkGlobals.pipelineLayouts[k],
+			VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(*p), p);
+
+		bindTextureSet(k, tex);
+		vkCmdDrawIndexed(cmd, inst->numIndex, 1, inst->startIndex, 0, 0);
+	}
+}
+
+// Per-atomic uniforms: transforms, lights and fog
+static void
+makeLitUniforms(Atomic *atomic, Lit3DUniforms *u, Lit3DPush *p)
+{
+	Matrix ident;
+	ident.setIdentity();
+	Matrix *world = atomic->getFrame() ? atomic->getFrame()->getLTM() : &ident;
+	memset(u, 0, sizeof(*u));
+	memset(p, 0, sizeof(*p));
+	makeMVP(u->mvp, world);
+	makeRawMatrix(u->world, world);
+	setLit3DLights(u, p, atomic);
+	setLit3DFog(u);
+}
+
 void
 defaultRenderCB(Atomic *atomic)
 {
@@ -5895,73 +6580,22 @@ defaultRenderCB(Atomic *atomic)
 	Context *ctx = &vkGlobals.context;
 	VkCommandBuffer cmd = ctx->commandBuffers[ctx->currentFrame];
 
-	Matrix ident;
-	ident.setIdentity();
-	Matrix *world = atomic->getFrame() ? atomic->getFrame()->getLTM() : &ident;
-
-	Lit3DUniforms u;
-	Lit3DPush p;
-	memset(&u, 0, sizeof(u));
-	memset(&p, 0, sizeof(p));
-	makeMVP(u.mvp, world);
-	makeRawMatrix(u.world, world);
-	setLit3DLights(&u, &p, atomic);
-	setLit3DFog(&u);
-
-	VkBuffer vertexBuffers[] = { header->vertexBuffer };
-	VkDeviceSize offsets[] = { 0 };
-	vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, offsets);
-	vkCmdBindIndexBuffer(cmd, header->indexBuffer, 0, VK_INDEX_TYPE_UINT16);
-
 	// One upload and one descriptor bind for the whole atomic; what varies per
 	// mesh rides along in push constants instead.
-	VkDeviceSize uboOffset;
-	if(!uploadDynamicBuffer(&vkGlobals.litUniformBuffers[ctx->currentFrame], &vkGlobals.litUniformOffset,
-		&u, sizeof(u), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, vkGlobals.uboAlignment, &uboOffset))
+	Lit3DUniforms u;
+	Lit3DPush p;
+	makeLitUniforms(atomic, &u, &p);
+	uint32 dynamicOffset;
+	if(!uploadLitUniforms(&u, &dynamicOffset))
 		return;
-	uint32 dynamicOffset = (uint32)uboOffset;
+
+	VkDeviceSize vertexOffset = header->vertexOffset;
+	vkCmdBindVertexBuffers(cmd, 0, 1, &header->vertexBuffer, &vertexOffset);
+	vkCmdBindIndexBuffer(cmd, header->indexBuffer, header->indexOffset, VK_INDEX_TYPE_UINT16);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkGlobals.pipelineLayouts[k],
 		1, 1, &vkGlobals.litDescriptorSets[ctx->currentFrame], 1, &dynamicOffset);
 
-	RGBA white = { 255, 255, 255, 255 };
-	static const SurfaceProperties defaultSurfProps = { 1.0f, 0.0f, 1.0f };
-	for(uint32 i = 0; i < header->numMeshes; i++){
-		InstanceData *inst = &header->inst[i];
-		if(inst->numIndex == 0)
-			continue;
-		Material *mat = inst->material;
-		RGBA matColor = white;
-		const SurfaceProperties *surf = &defaultSurfProps;
-		VkDescriptorSet tex = vkGlobals.whiteDescriptorSet;
-		Raster *texRaster = nil;
-		if(mat){
-			if(geo->flags & Geometry::MODULATE)
-				matColor = mat->color;
-			surf = &mat->surfaceProps;
-			if(mat->texture && mat->texture->raster){
-				texRaster = mat->texture->raster;
-				tex = getTextureDescriptor(texRaster);
-			}
-		}
-
-		bool32 alpha = inst->vertexAlpha || matColor.alpha != 0xFF ||
-			rasterHasAlpha(texRaster) || getRenderStateUInt(VERTEXALPHA, 0);
-		VkPipeline pipeline = getDrawPipeline(k, primType, alpha);
-		if(vkGlobals.currentPipeline != pipeline){
-			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-			vkGlobals.currentPipeline = pipeline;
-		}
-
-		colorToFloat(p.matColor, matColor);
-		p.surfProps[0] = surf->ambient;
-		p.surfProps[1] = surf->diffuse;
-		makeAlphaRef(p.alphaRef, alpha);
-		vkCmdPushConstants(cmd, vkGlobals.pipelineLayouts[k],
-			VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(p), &p);
-
-		bindTextureSet(k, tex);
-		vkCmdDrawIndexed(cmd, inst->numIndex, 1, inst->startIndex, 0, 0);
-	}
+	drawLitMeshes(cmd, geo, header, k, primType, &p);
 }
 
 static void vulkanPipeInstance(rw::ObjPipeline*, Atomic*) {}
@@ -6006,8 +6640,19 @@ skinRenderCB(Atomic *atomic)
 	Geometry *geo = atomic->geometry;
 	if(geo == nil || geo->numVertices <= 0 || geo->meshHeader == nil)
 		return;
-	MeshHeader *meshh = geo->meshHeader;
-	if(!ensureTempGeometry(geo->numVertices, meshh->totalIndices))
+
+	// Colors, texture coordinates, indices and the per-mesh data don't change
+	// with the pose, so they come from the instanced copy; only positions and
+	// normals are skinned each frame.
+	InstanceDataHeader *header = ensureInstanced(atomic);
+	if(header == nil || header->numMeshes == 0 || header->vertices == nil)
+		return;
+
+	PrimitiveType primType = (PrimitiveType)header->primType;
+	PipelineKind k = selectLit3DPipelineKind();
+	if(!validDrawState(k, primType))
+		return;
+	if(!ensureLitUniformResources())
 		return;
 
 	Skin *skin = Skin::get(geo);
@@ -6040,179 +6685,84 @@ skinRenderCB(Atomic *atomic)
 			skinMats[i].setIdentity();
 	}
 
-	bool32 hasNormals = !!(geo->flags & Geometry::NORMALS);
-	bool32 hasPrelit = !!(geo->flags & Geometry::PRELIT);
-	bool32 hasTex = geo->numTexCoordSets > 0 && geo->texCoords[0] != nil;
-	MorphTarget *morph = &geo->morphTargets[0];
-	RGBA white = { 255, 255, 255, 255 };
-	RGBA black = { 0, 0, 0, 255 };
-	for(int32 i = 0; i < geo->numVertices; i++){
-		Im3DVertex &v = vkGlobals.tempVertices[i];
-		V3d srcPos = morph->vertices[i];
-		V3d srcNrm;
-		if(hasNormals)
-			srcNrm = morph->normals[i];
-		else{
-			srcNrm.x = 0.0f;
-			srcNrm.y = 0.0f;
-			srcNrm.z = 1.0f;
-		}
-
-		// CPU skinning: blend by bone weights
-		if(skin && skin->weights && skin->indices && numBones > 0){
-			const uint8 *idx = &skin->indices[i*4];
-			const float *wgt = &skin->weights[i*4];
-			if(wgt[0] >= 0.999f && idx[0] < numBones){
-				// Fast path: single-bone rigid weight
-				const Matrix *m = &skinMats[idx[0]];
-				v.position.x = m->right.x*srcPos.x + m->up.x*srcPos.y + m->at.x*srcPos.z + m->pos.x;
-				v.position.y = m->right.y*srcPos.x + m->up.y*srcPos.y + m->at.y*srcPos.z + m->pos.y;
-				v.position.z = m->right.z*srcPos.x + m->up.z*srcPos.y + m->at.z*srcPos.z + m->pos.z;
-				v.normal.x = m->right.x*srcNrm.x + m->up.x*srcNrm.y + m->at.x*srcNrm.z;
-				v.normal.y = m->right.y*srcNrm.x + m->up.y*srcNrm.y + m->at.y*srcNrm.z;
-				v.normal.z = m->right.z*srcNrm.x + m->up.z*srcNrm.y + m->at.z*srcNrm.z;
-			}else{
-				V3d pos = {0,0,0};
-				V3d nrm = {0,0,0};
-				for(int32 j = 0; j < 4; j++){
-					float w = wgt[j];
-					if(w == 0.0f) continue;
-					uint8 boneIdx = idx[j];
-					if(boneIdx >= numBones) continue;
-					const Matrix *m = &skinMats[boneIdx];
-					// Transform point: pos += w * (m * srcPos)
-					pos.x += w * (m->right.x*srcPos.x + m->up.x*srcPos.y + m->at.x*srcPos.z + m->pos.x);
-					pos.y += w * (m->right.y*srcPos.x + m->up.y*srcPos.y + m->at.y*srcPos.z + m->pos.y);
-					pos.z += w * (m->right.z*srcPos.x + m->up.z*srcPos.y + m->at.z*srcPos.z + m->pos.z);
-					// Transform vector: nrm += w * (m * srcNrm)
-					nrm.x += w * (m->right.x*srcNrm.x + m->up.x*srcNrm.y + m->at.x*srcNrm.z);
-					nrm.y += w * (m->right.y*srcNrm.x + m->up.y*srcNrm.y + m->at.y*srcNrm.z);
-					nrm.z += w * (m->right.z*srcNrm.x + m->up.z*srcNrm.y + m->at.z*srcNrm.z);
-				}
-				v.position = pos;
-				// Normalize
-				float len = sqrtf(nrm.x*nrm.x + nrm.y*nrm.y + nrm.z*nrm.z);
-				if(len > 0.0001f){
-					float invLen = 1.0f / len;
-					nrm.x *= invLen;
-					nrm.y *= invLen;
-					nrm.z *= invLen;
-				}
-				v.normal = nrm;
-			}
-		}else{
-			v.position = srcPos;
-			v.normal = srcNrm;
-		}
-
-		// Write prelit color — the lit3d vertex shader applies lighting
-		RGBA c = hasPrelit ? geo->colors[i] :
-			((geo->flags & Geometry::LIGHT) ? black : white);
-		v.r = c.red;
-		v.g = c.green;
-		v.b = c.blue;
-		v.a = (hasPrelit && c.alpha != 0) ? c.alpha : 255;
-		if(hasTex){
-			v.u = geo->texCoords[0][i].u;
-			v.v = geo->texCoords[0][i].v;
-		}else{
-			v.u = 0.0f;
-			v.v = 0.0f;
-		}
-	}
-
-	PrimitiveType primType = meshh->flags == MeshHeader::TRISTRIP ? PRIMTYPETRISTRIP : PRIMTYPETRILIST;
-	PipelineKind k = selectLit3DPipelineKind();
-	if(!validDrawState(k, primType))
-		return;
-	if(!ensureLitUniformResources())
-		return;
-
 	Context *ctx = &vkGlobals.context;
 	VkCommandBuffer cmd = ctx->commandBuffers[ctx->currentFrame];
 
-	Matrix ident;
-	ident.setIdentity();
-	Matrix *world = atomic->getFrame() ? atomic->getFrame()->getLTM() : &ident;
+	// Skin straight into this frame's vertex buffer, no temporary copy
+	uint32 numVertices = header->totalNumVertex;
+	VulkanBuffer *vertexBuffer = &vkGlobals.dynamicVertexBuffers[ctx->currentFrame];
+	VkDeviceSize vertexOffset;
+	Im3DVertex *dst = (Im3DVertex*)allocDynamicBuffer(vertexBuffer, &vkGlobals.dynamicVertexOffset,
+		(VkDeviceSize)numVertices * sizeof(Im3DVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 16, &vertexOffset);
+	if(dst == nil)
+		return;
+
+	const Im3DVertex *src = header->vertices;
+	bool32 canSkin = skin && skin->weights && skin->indices && numBones > 0 &&
+		(uint32)geo->numVertices >= numVertices;
+	if(!canSkin)
+		memcpy(dst, src, (size_t)numVertices * sizeof(Im3DVertex));
+	else for(uint32 i = 0; i < numVertices; i++){
+		Im3DVertex v = src[i];
+		V3d srcPos = src[i].position;
+		V3d srcNrm = src[i].normal;
+
+		// CPU skinning: blend by bone weights
+		const uint8 *idx = &skin->indices[i*4];
+		const float *wgt = &skin->weights[i*4];
+		if(wgt[0] >= 0.999f && idx[0] < numBones){
+			// Fast path: single-bone rigid weight
+			const Matrix *m = &skinMats[idx[0]];
+			v.position.x = m->right.x*srcPos.x + m->up.x*srcPos.y + m->at.x*srcPos.z + m->pos.x;
+			v.position.y = m->right.y*srcPos.x + m->up.y*srcPos.y + m->at.y*srcPos.z + m->pos.y;
+			v.position.z = m->right.z*srcPos.x + m->up.z*srcPos.y + m->at.z*srcPos.z + m->pos.z;
+			v.normal.x = m->right.x*srcNrm.x + m->up.x*srcNrm.y + m->at.x*srcNrm.z;
+			v.normal.y = m->right.y*srcNrm.x + m->up.y*srcNrm.y + m->at.y*srcNrm.z;
+			v.normal.z = m->right.z*srcNrm.x + m->up.z*srcNrm.y + m->at.z*srcNrm.z;
+		}else{
+			V3d pos = {0,0,0};
+			V3d nrm = {0,0,0};
+			for(int32 j = 0; j < 4; j++){
+				float w = wgt[j];
+				if(w == 0.0f) continue;
+				uint8 boneIdx = idx[j];
+				if(boneIdx >= numBones) continue;
+				const Matrix *m = &skinMats[boneIdx];
+				pos.x += w * (m->right.x*srcPos.x + m->up.x*srcPos.y + m->at.x*srcPos.z + m->pos.x);
+				pos.y += w * (m->right.y*srcPos.x + m->up.y*srcPos.y + m->at.y*srcPos.z + m->pos.y);
+				pos.z += w * (m->right.z*srcPos.x + m->up.z*srcPos.y + m->at.z*srcPos.z + m->pos.z);
+				nrm.x += w * (m->right.x*srcNrm.x + m->up.x*srcNrm.y + m->at.x*srcNrm.z);
+				nrm.y += w * (m->right.y*srcNrm.x + m->up.y*srcNrm.y + m->at.y*srcNrm.z);
+				nrm.z += w * (m->right.z*srcNrm.x + m->up.z*srcNrm.y + m->at.z*srcNrm.z);
+			}
+			v.position = pos;
+			float len = sqrtf(nrm.x*nrm.x + nrm.y*nrm.y + nrm.z*nrm.z);
+			if(len > 0.0001f){
+				float invLen = 1.0f / len;
+				nrm.x *= invLen;
+				nrm.y *= invLen;
+				nrm.z *= invLen;
+			}
+			v.normal = nrm;
+		}
+		// one sequential store per vertex into write-combined memory
+		dst[i] = v;
+	}
 
 	// Set up lit3d uniforms once for the whole atomic
 	Lit3DUniforms u;
 	Lit3DPush p;
-	memset(&u, 0, sizeof(u));
-	memset(&p, 0, sizeof(p));
-	makeMVP(u.mvp, world);
-	makeRawMatrix(u.world, world);
-	setLit3DLights(&u, &p, atomic);
-	setLit3DFog(&u);
-
-	// Upload skinned vertex buffer once
-	VkDeviceSize vertexSize = (VkDeviceSize)geo->numVertices * sizeof(Im3DVertex);
-	VulkanBuffer *vertexBuffer = &vkGlobals.dynamicVertexBuffers[ctx->currentFrame];
-	VkDeviceSize vertexOffset;
-	if(!uploadDynamicBuffer(vertexBuffer, &vkGlobals.dynamicVertexOffset, vkGlobals.tempVertices,
-		vertexSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 16, &vertexOffset))
+	makeLitUniforms(atomic, &u, &p);
+	uint32 dynamicOffset;
+	if(!uploadLitUniforms(&u, &dynamicOffset))
 		return;
-	VkBuffer vertexBuffers[] = { vertexBuffer->buffer };
-	VkDeviceSize vbOffsets[] = { vertexOffset };
-	vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, vbOffsets);
 
-	// Upload UBO once
-	VkDeviceSize uboOffset;
-	if(!uploadDynamicBuffer(&vkGlobals.litUniformBuffers[ctx->currentFrame], &vkGlobals.litUniformOffset,
-		&u, sizeof(u), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, vkGlobals.uboAlignment, &uboOffset))
-		return;
-	uint32 dynamicOffset = (uint32)uboOffset;
+	vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer->buffer, &vertexOffset);
+	vkCmdBindIndexBuffer(cmd, header->indexBuffer, header->indexOffset, VK_INDEX_TYPE_UINT16);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkGlobals.pipelineLayouts[k],
 		1, 1, &vkGlobals.litDescriptorSets[ctx->currentFrame], 1, &dynamicOffset);
 
-	bool32 vertexAlpha = geometryHasVertexAlpha(geo);
-	Mesh *mesh = meshh->getMeshes();
-	static const SurfaceProperties defaultSurfProps = { 1.0f, 0.0f, 1.0f };
-
-	for(uint32 i = 0; i < meshh->numMeshes; i++){
-		if(mesh[i].numIndices <= 0)
-			continue;
-		Material *mat = mesh[i].material;
-		RGBA matColor = white;
-		const SurfaceProperties *surf = &defaultSurfProps;
-		VkDescriptorSet tex = vkGlobals.whiteDescriptorSet;
-		Raster *texRaster = nil;
-		if(mat){
-			if(geo->flags & Geometry::MODULATE)
-				matColor = mat->color;
-			surf = &mat->surfaceProps;
-			if(mat->texture && mat->texture->raster){
-				texRaster = mat->texture->raster;
-				tex = getTextureDescriptor(texRaster);
-			}
-		}
-
-		VulkanBuffer *indexBuffer = &vkGlobals.dynamicIndexBuffers[ctx->currentFrame];
-		VkDeviceSize indexSize = (VkDeviceSize)mesh[i].numIndices * sizeof(uint16);
-		VkDeviceSize indexOffset;
-		if(!uploadDynamicBuffer(indexBuffer, &vkGlobals.dynamicIndexOffset, mesh[i].indices,
-			indexSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, 2, &indexOffset))
-			continue;
-
-		bool32 alpha = vertexAlpha || matColor.alpha != 0xFF ||
-			rasterHasAlpha(texRaster) || getRenderStateUInt(VERTEXALPHA, 0);
-		VkPipeline pipeline = getDrawPipeline(k, primType, alpha);
-		if(vkGlobals.currentPipeline != pipeline){
-			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-			vkGlobals.currentPipeline = pipeline;
-		}
-		vkCmdBindIndexBuffer(cmd, indexBuffer->buffer, indexOffset, VK_INDEX_TYPE_UINT16);
-
-		colorToFloat(p.matColor, matColor);
-		p.surfProps[0] = surf->ambient;
-		p.surfProps[1] = surf->diffuse;
-		makeAlphaRef(p.alphaRef, alpha);
-		vkCmdPushConstants(cmd, vkGlobals.pipelineLayouts[k],
-			VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(p), &p);
-
-		bindTextureSet(k, tex);
-		vkCmdDrawIndexed(cmd, mesh[i].numIndices, 1, 0, 0, 0);
-	}
+	drawLitMeshes(cmd, geo, header, k, primType, &p);
 }
 
 static ObjPipeline*
@@ -6305,23 +6855,16 @@ matfxRenderCB(Atomic *atomic)
 	Context *ctx = &vkGlobals.context;
 	VkCommandBuffer cmd = ctx->commandBuffers[ctx->currentFrame];
 
-	Matrix ident;
-	ident.setIdentity();
-	Matrix *world = atomic->getFrame() ? atomic->getFrame()->getLTM() : &ident;
-
 	Lit3DUniforms u;
-	memset(&u, 0, sizeof(u));
-	makeMVP(u.mvp, world);
-	makeRawMatrix(u.world, world);
 	Lit3DPush p;
-	memset(&p, 0, sizeof(p));
-	setLit3DLights(&u, &p, atomic);
-	setLit3DFog(&u);
+	makeLitUniforms(atomic, &u, &p);
+	// Meshes without an env map all share the plain uniforms, upload them once
+	uint32 baseOffset = 0;
+	bool32 baseUploaded = 0;
 
-	VkBuffer vertexBuffers[] = { header->vertexBuffer };
-	VkDeviceSize offsets[] = { 0 };
-	vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, offsets);
-	vkCmdBindIndexBuffer(cmd, header->indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+	VkDeviceSize vertexOffset = header->vertexOffset;
+	vkCmdBindVertexBuffers(cmd, 0, 1, &header->vertexBuffer, &vertexOffset);
+	vkCmdBindIndexBuffer(cmd, header->indexBuffer, header->indexOffset, VK_INDEX_TYPE_UINT16);
 
 	RGBA white = { 255, 255, 255, 255 };
 	static const SurfaceProperties defaultSurfProps = { 1.0f, 0.0f, 1.0f };
@@ -6373,27 +6916,33 @@ matfxRenderCB(Atomic *atomic)
 		vkCmdPushConstants(cmd, vkGlobals.pipelineLayouts[k],
 			VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(p), &p);
 
+		uint32 dynamicOffset;
 		if(useEnvMap){
+			Lit3DUniforms envU = u;
 			MatFX::Env *env = &matfx->fx[0].env;
-			getEnvMatrix(u.texMatrix, env->frame);
+			getEnvMatrix(envU.texMatrix, env->frame);
 			if(MatFX::envMapApplyLight){
-				u.colorClamp[0] = u.colorClamp[1] = u.colorClamp[2] = u.colorClamp[3] = 0.0f;
+				envU.colorClamp[0] = envU.colorClamp[1] = envU.colorClamp[2] = envU.colorClamp[3] = 0.0f;
 			}else{
-				u.colorClamp[0] = u.colorClamp[1] = u.colorClamp[2] = u.colorClamp[3] = 1.0f;
+				envU.colorClamp[0] = envU.colorClamp[1] = envU.colorClamp[2] = envU.colorClamp[3] = 1.0f;
 			}
 			RGBA envcol = MatFX::envMapUseMatColor ? matColor : MatFX::envMapColor;
-			colorToFloat(u.envColor, envcol);
-			u.fxParams[0] = env->coefficient;
-			u.fxParams[1] = env->fbAlpha ? 0.0f : 1.0f;
+			colorToFloat(envU.envColor, envcol);
+			envU.fxParams[0] = env->coefficient;
+			envU.fxParams[1] = env->fbAlpha ? 0.0f : 1.0f;
 			bool32 gl3BaseAlpha = matColor.alpha != 0xFF;
-			u.fxParams[2] = gl3BaseAlpha ? 0.0f : 1.0f;	// keep body opaque
-			u.fxParams[3] = 0.0f;
+			envU.fxParams[2] = gl3BaseAlpha ? 0.0f : 1.0f;	// keep body opaque
+			envU.fxParams[3] = 0.0f;
+			if(!uploadLitUniforms(&envU, &dynamicOffset))
+				return;
+		}else{
+			if(!baseUploaded){
+				if(!uploadLitUniforms(&u, &baseOffset))
+					return;
+				baseUploaded = 1;
+			}
+			dynamicOffset = baseOffset;
 		}
-
-		VkDeviceSize uboOffset;
-		if(!uploadDynamicBuffer(&vkGlobals.litUniformBuffers[ctx->currentFrame], &vkGlobals.litUniformOffset,
-			&u, sizeof(u), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, vkGlobals.uboAlignment, &uboOffset))
-			return;
 
 		bindTextureSet(k, tex);
 
@@ -6405,7 +6954,6 @@ matfxRenderCB(Atomic *atomic)
 				2, 1, &envSet, 0, nil);
 		}
 
-		uint32 dynamicOffset = (uint32)uboOffset;
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkGlobals.pipelineLayouts[k],
 			1, 1, &vkGlobals.litDescriptorSets[ctx->currentFrame], 1, &dynamicOffset);
 		vkCmdDrawIndexed(cmd, inst->numIndex, 1, inst->startIndex, 0, 0);

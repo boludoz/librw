@@ -91,6 +91,17 @@ void setPresentModePreference(int32 preference);
 void notifySurfaceLost(void);
 void notifyAppBackground(bool32 background);
 
+// A range of one of the backend's large device memory blocks. Individual
+// geometries and textures are carved out of these instead of each getting
+// its own vkAllocateMemory, which is slow and limited in count on mobile.
+struct VulkanAllocation
+{
+	void *block;
+	uint64 offset;
+	uint64 size;
+	uint32 generation;
+};
+
 struct Im3DVertex
 {
 	V3d     position;
@@ -153,7 +164,8 @@ struct VulkanRaster
 	int32 numLevels;
 	RasterLevels *levels;
 	VkImage image;
-	VkDeviceMemory imageMemory;
+	VkDeviceMemory imageMemory;	// only for dedicated allocations
+	VulkanAllocation imageAlloc;
 	VkImageView imageView;
 	VkSampler sampler;
 	VkDescriptorSet descriptorSet;
@@ -184,12 +196,17 @@ struct InstanceDataHeader : rw::InstanceDataHeader
 	Im3DVertex *vertices;	// object space
 	uint16 *indices;
 	InstanceData *inst;
+	// vertices and indices share one sub-allocation of a big buffer
 	VkBuffer vertexBuffer;
 	VkDeviceMemory vertexBufferMemory;
 	VkBuffer indexBuffer;
 	VkDeviceMemory indexBufferMemory;
+	VulkanAllocation bufferAlloc;
+	uint64 vertexOffset;
+	uint64 indexOffset;
 	bool32 gpuDirty;
 	bool32 isSkinned;
+	bool32 anyVertexAlpha;
 	// list of all instanced geometries so GPU buffers can be
 	// released when the device goes away
 	InstanceDataHeader *prevInst;
