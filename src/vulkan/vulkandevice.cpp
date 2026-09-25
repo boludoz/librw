@@ -3279,7 +3279,7 @@ createGraphicsPipeline(PipelineKind kind, BlendPipelineMode blendMode, Primitive
 	VkShaderModule vertShader, VkShaderModule fragShader,
 	VkVertexInputBindingDescription *bindingDesc,
 	VkVertexInputAttributeDescription *attribDescs, uint32 attribCount,
-	VkPipelineLayout layout = VK_NULL_HANDLE, VkPipeline *out = nil)
+	VkPipelineLayout layout = VK_NULL_HANDLE, VkPipeline *out = nil, uint32 bindingCount = 1)
 {
 	Context *ctx = &vkGlobals.context;
 	if(vertShader == VK_NULL_HANDLE || fragShader == VK_NULL_HANDLE)
@@ -3299,7 +3299,7 @@ createGraphicsPipeline(PipelineKind kind, BlendPipelineMode blendMode, Primitive
 	VkPipelineVertexInputStateCreateInfo vertexInput;
 	memset(&vertexInput, 0, sizeof(vertexInput));
 	vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-	vertexInput.vertexBindingDescriptionCount = 1;
+	vertexInput.vertexBindingDescriptionCount = bindingCount;
 	vertexInput.pVertexBindingDescriptions = bindingDesc;
 	vertexInput.vertexAttributeDescriptionCount = attribCount;
 	vertexInput.pVertexAttributeDescriptions = attribDescs;
@@ -6389,6 +6389,7 @@ destroyInstanceGpuBuffers(InstanceDataHeader *header)
 	header->indexBuffer = VK_NULL_HANDLE;
 	header->indexBufferMemory = VK_NULL_HANDLE;
 	header->vertexOffset = 0;
+	header->texCoords1Offset = 0;
 	header->indexOffset = 0;
 	header->gpuDirty = 1;
 }
@@ -6423,26 +6424,32 @@ ensureInstanceBuffers(InstanceDataHeader *header)
 		return 0;
 	if(gpuAllocValid(&header->bufferAlloc) && !header->gpuDirty)
 		return 1;
-	if(vkGlobals.context.device == VK_NULL_HANDLE || header->vertices == nil || header->indices == nil)
+	if(vkGlobals.context.device == VK_NULL_HANDLE || header->vertices == nil ||
+	   header->texCoords1 == nil || header->indices == nil)
 		return 0;
 	destroyInstanceGpuBuffers(header);
 
 	// Skinned geometry streams its vertices every frame but still keeps its
 	// indices here instead of re-uploading them per mesh per frame. Its bind
 	// pose is kept too so the default pipeline can draw it as well.
+	// vertices | second texture coordinate set | indices
 	VkDeviceSize vertexSize = (VkDeviceSize)header->totalNumVertex*sizeof(Im3DVertex);
-	VkDeviceSize indexStart = (vertexSize + 3) & ~(VkDeviceSize)3;
+	VkDeviceSize texCoordsStart = (vertexSize + 7) & ~(VkDeviceSize)7;
+	VkDeviceSize texCoordsSize = (VkDeviceSize)header->totalNumVertex*sizeof(TexCoords);
+	VkDeviceSize indexStart = texCoordsStart + texCoordsSize;
 	VkDeviceSize indexSize = (VkDeviceSize)header->totalNumIndex*sizeof(uint16);
 	if(!gpuAlloc(GPU_HEAP_BUFFER, indexStart + indexSize, GPU_BUFFER_ALIGNMENT, 0xFFFFFFFF, &header->bufferAlloc))
 		return 0;
 	GpuBlock *block = (GpuBlock*)header->bufferAlloc.block;
 	uint8 *dst = block->mapped + header->bufferAlloc.offset;
 	memcpy(dst, header->vertices, (size_t)vertexSize);
+	memcpy(dst + texCoordsStart, header->texCoords1, (size_t)texCoordsSize);
 	memcpy(dst + indexStart, header->indices, (size_t)indexSize);
 
 	header->vertexBuffer = block->buffer;
 	header->indexBuffer = block->buffer;
 	header->vertexOffset = header->bufferAlloc.offset;
+	header->texCoords1Offset = header->bufferAlloc.offset + texCoordsStart;
 	header->indexOffset = header->bufferAlloc.offset + indexStart;
 	header->gpuDirty = 0;
 	return 1;
@@ -6461,6 +6468,7 @@ freeInstanceData(Geometry *geometry)
 	unlinkInstanceData(header);
 	destroyInstanceGpuBuffers(header);
 	rwFree(header->vertices);
+	rwFree(header->texCoords1);
 	rwFree(header->indices);
 	rwFree(header->inst);
 	rwFree(header);
@@ -6529,8 +6537,15 @@ defaultInstanceCB(Geometry *geo, InstanceDataHeader *header)
 		return;
 	if(header->vertices == nil)
 		header->vertices = rwNewT(Im3DVertex, geo->numVertices, MEMDUR_EVENT | ID_GEOMETRY);
-	if(header->vertices == nil)
+	if(header->texCoords1 == nil)
+		header->texCoords1 = rwNewT(TexCoords, geo->numVertices, MEMDUR_EVENT | ID_GEOMETRY);
+	if(header->vertices == nil || header->texCoords1 == nil)
 		return;
+	int32 set1 = geo->numTexCoordSets > 1 && geo->texCoords[1] ? 1 : 0;
+	if(geo->numTexCoordSets > 0 && geo->texCoords[set1])
+		memcpy(header->texCoords1, geo->texCoords[set1], sizeof(TexCoords)*geo->numVertices);
+	else
+		memset(header->texCoords1, 0, sizeof(TexCoords)*geo->numVertices);
 
 	bool32 hasNormals = !!(geo->flags & Geometry::NORMALS);
 	bool32 hasPrelit = !!(geo->flags & Geometry::PRELIT);
@@ -7272,6 +7287,7 @@ struct CustomShader
 	VkShaderModule vert, frag;
 	// [depth mode][blend mode][0 = tri list, 1 = tri strip], built on first use
 	VkPipeline pipelines[4][PIPE_BLEND_COUNT][2];
+	bool32 twoTexCoords;
 	CustomShader *next;
 };
 
@@ -7299,7 +7315,8 @@ destroyCustomShaderPipelines(CustomShader *sh, bool32 modulesToo)
 }
 
 CustomShader*
-createCustomShader(const uint32 *vertSpv, size_t vertSize, const uint32 *fragSpv, size_t fragSize)
+createCustomShader(const uint32 *vertSpv, size_t vertSize, const uint32 *fragSpv, size_t fragSize,
+	bool32 twoTexCoords)
 {
 	CustomShader *sh = rwNewT(CustomShader, 1, MEMDUR_EVENT | ID_DRIVER);
 	if(sh == nil)
@@ -7318,6 +7335,7 @@ createCustomShader(const uint32 *vertSpv, size_t vertSize, const uint32 *fragSpv
 	memcpy(sh->fragSpv, fragSpv, fragSize);
 	sh->vertSize = vertSize;
 	sh->fragSize = fragSize;
+	sh->twoTexCoords = twoTexCoords;
 	sh->next = vkGlobals.customShaders;
 	vkGlobals.customShaders = sh;
 	return sh;
@@ -7364,17 +7382,28 @@ getCustomPipeline(CustomShader *sh, int32 zmode, BlendPipelineMode blend, Primit
 		sh->frag = createShaderModule(sh->fragSpv, sh->fragSize);
 	if(sh->vert == VK_NULL_HANDLE || sh->frag == VK_NULL_HANDLE)
 		return VK_NULL_HANDLE;
-	VkVertexInputBindingDescription binding;
-	VkVertexInputAttributeDescription attribs[4];
-	makeIm3DVertexInput(&binding, attribs);
+	VkVertexInputBindingDescription bindings[2];
+	VkVertexInputAttributeDescription attribs[5];
+	makeIm3DVertexInput(&bindings[0], attribs);
+	// second texture coordinate set from its own stream
+	memset(&bindings[1], 0, sizeof(bindings[1]));
+	bindings[1].binding = 1;
+	bindings[1].stride = sizeof(TexCoords);
+	bindings[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+	memset(&attribs[4], 0, sizeof(attribs[4]));
+	attribs[4].location = 4;
+	attribs[4].binding = 1;
+	attribs[4].format = VK_FORMAT_R32G32_SFLOAT;
+	uint32 numBindings = sh->twoTexCoords ? 2 : 1;
 	// depth state comes from the equivalent lit3d kind
 	createGraphicsPipeline((PipelineKind)(PIPE_LIT3D + zmode), blend, primType, sh->vert, sh->frag,
-		&binding, attribs, 4, vkGlobals.pipelineLayouts[PIPE_CUSTOM], slot);
+		bindings, attribs, sh->twoTexCoords ? 5 : 4, vkGlobals.pipelineLayouts[PIPE_CUSTOM], slot, numBindings);
 	return *slot;
 }
 
 InstanceDataHeader*
-customBeginAtomic(Atomic *atomic, CustomShader *shader, const float *custom, int32 numVec4s)
+customBeginAtomic(Atomic *atomic, CustomShader *shader, const float *custom, int32 numVec4s,
+	const CustomAtomicOptions *options)
 {
 	vkGlobals.custom.shader = nil;
 	Geometry *geo = atomic->geometry;
@@ -7390,7 +7419,27 @@ customBeginAtomic(Atomic *atomic, CustomShader *shader, const float *custom, int
 	Context *ctx = &vkGlobals.context;
 	VkCommandBuffer cmd = ctx->commandBuffers[ctx->currentFrame];
 	Lit3DUniforms u;
-	makeLitUniforms(atomic, &u, &vkGlobals.custom.push);
+	Lit3DPush *push = &vkGlobals.custom.push;
+	if(options && (options->world || options->ambientOnly)){
+		Matrix ident;
+		ident.setIdentity();
+		const Matrix *world = options->world ? options->world :
+			atomic->getFrame() ? atomic->getFrame()->getLTM() : &ident;
+		memset(&u, 0, sizeof(u));
+		memset(push, 0, sizeof(*push));
+		makeMVP(u.mvp, (Matrix*)world);
+		makeRawMatrix(u.world, (Matrix*)world);
+		if(options->ambientOnly){
+			push->surfProps[2] = 1.0f;
+			u.ambient[0] = options->ambient.red;
+			u.ambient[1] = options->ambient.green;
+			u.ambient[2] = options->ambient.blue;
+			u.ambient[3] = options->ambient.alpha;
+		}else
+			setLit3DLights(&u, push, atomic);
+		setLit3DFog(&u);
+	}else
+		makeLitUniforms(atomic, &u, push);
 	if(custom && numVec4s > 0){
 		if(numVec4s > CUSTOM_UNIFORM_VEC4S)
 			numVec4s = CUSTOM_UNIFORM_VEC4S;
@@ -7403,6 +7452,10 @@ customBeginAtomic(Atomic *atomic, CustomShader *shader, const float *custom, int
 	}else{
 		VkDeviceSize vertexOffset = header->vertexOffset;
 		vkCmdBindVertexBuffers(cmd, 0, 1, &header->vertexBuffer, &vertexOffset);
+	}
+	if(shader->twoTexCoords){
+		VkDeviceSize texCoordsOffset = header->texCoords1Offset;
+		vkCmdBindVertexBuffers(cmd, 1, 1, &header->vertexBuffer, &texCoordsOffset);
 	}
 	uint32 dynamicOffset;
 	if(!uploadLitUniforms(&u, &dynamicOffset))
@@ -7435,7 +7488,7 @@ customSetTexture1(Raster *raster)
 }
 
 void
-customDrawMesh(InstanceData *inst, const float *customPush)
+customDrawMesh(InstanceData *inst, const float *customPush, const RGBA *matColorOverride)
 {
 	CustomShader *sh = vkGlobals.custom.shader;
 	if(sh == nil || inst == nil || inst->numIndex == 0)
@@ -7459,6 +7512,8 @@ customDrawMesh(InstanceData *inst, const float *customPush)
 			tex = getTextureDescriptor(texRaster);
 		}
 	}
+	if(matColorOverride)
+		matColor = *matColorOverride;
 	bool32 alpha = inst->vertexAlpha || matColor.alpha != 0xFF ||
 		getRenderStateUInt(VERTEXALPHA, 0) || rasterHasAlpha(texRaster);
 

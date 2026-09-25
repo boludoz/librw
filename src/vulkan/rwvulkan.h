@@ -198,6 +198,7 @@ struct InstanceDataHeader : rw::InstanceDataHeader
 	uint32 totalNumVertex;
 	uint32 totalNumIndex;
 	Im3DVertex *vertices;	// object space
+	TexCoords *texCoords1;	// second set (lightmaps); the first one if there is none
 	uint16 *indices;
 	InstanceData *inst;
 	// vertices and indices share one sub-allocation of a big buffer
@@ -207,6 +208,7 @@ struct InstanceDataHeader : rw::InstanceDataHeader
 	VkDeviceMemory indexBufferMemory;
 	VulkanAllocation bufferAlloc;
 	uint64 vertexOffset;
+	uint64 texCoords1Offset;
 	uint64 indexOffset;
 	bool32 gpuDirty;
 	bool32 isSkinned;
@@ -233,16 +235,27 @@ public:
 // CUSTOM_UNIFORM_VEC4S extra vec4s at the end, set 2 texture 1. Push constants
 // are matColor, surfProps (x ambient, y diffuse, z lighting on), alphaRef and
 // one custom vec4 per mesh. Blending and depth follow the render states.
+// With twoTexCoords the second texture coordinate set is input location 4.
 enum { CUSTOM_UNIFORM_VEC4S = 16 };
 struct CustomShader;
-CustomShader *createCustomShader(const uint32 *vertSpv, size_t vertSize, const uint32 *fragSpv, size_t fragSize);
+CustomShader *createCustomShader(const uint32 *vertSpv, size_t vertSize, const uint32 *fragSpv, size_t fragSize,
+	bool32 twoTexCoords = 0);
 void destroyCustomShader(CustomShader *shader);
+struct CustomAtomicOptions
+{
+	const Matrix *world;	// instead of the atomic's frame
+	bool32 ambientOnly;	// light with `ambient` alone instead of the world's lights
+	RGBAf ambient;
+};
 // Instances the atomic, fills and binds the standard uniforms plus `custom`
 // (numVec4s of them), binds its buffers (skinned geometry is skinned first).
 // Returns nil when the atomic can't be drawn.
-InstanceDataHeader *customBeginAtomic(Atomic *atomic, CustomShader *shader, const float *custom, int32 numVec4s);
+InstanceDataHeader *customBeginAtomic(Atomic *atomic, CustomShader *shader, const float *custom, int32 numVec4s,
+	const CustomAtomicOptions *options = nil);
 void customSetTexture1(Raster *raster);
-void customDrawMesh(InstanceData *inst, const float *customPush);
+// matColor, if given, is used instead of the material color regardless of
+// the geometry's MODULATE flag.
+void customDrawMesh(InstanceData *inst, const float *customPush, const RGBA *matColor = nil);
 void customEndAtomic(void);
 
 extern int32 nativeRasterOffset;
