@@ -2229,16 +2229,10 @@ deviceSystemSDL2(DeviceReq req, void *arg, int32 n)
 		return 1;
 
 	case DEVICEGETSUBSSYSTEMINFO: {
-		int numDisplays;
-		SDL_DisplayID *displays = SDL_GetDisplays(&numDisplays);
-		if(displays == nil)
+		// SDL2 indexes displays directly; SDL_GetDisplays is SDL3 only
+		if(n < 0 || n >= SDL_GetNumVideoDisplays())
 			return 0;
-		if(n >= numDisplays) {
-			SDL_free(displays);
-			return 0;
-		}
-		const char *display_name = SDL_GetDisplayName(displays[n]);
-		SDL_free(displays);
+		const char *display_name = SDL_GetDisplayName(n);
 		if (display_name == nil)
 			return 0;
 		strncpy(((SubSystemInfo*)arg)->name, display_name, sizeof(SubSystemInfo::name));

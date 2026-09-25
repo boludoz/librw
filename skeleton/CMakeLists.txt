@@ -39,6 +39,11 @@ target_link_libraries(librw_skeleton
         librw
 )
 
+# The Switch's newlib has no fork/exec, which imgui's "open in shell" uses
+if(NINTENDO_SWITCH)
+    target_compile_definitions(librw_skeleton PRIVATE IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
+endif()
+
 if ((LIBRW_PLATFORM_GL3 AND LIBRW_GL3_GFXLIB MATCHES "SDL[23]") OR LIBRW_PLATFORM_VULKAN)
     target_compile_definitions(librw_skeleton PRIVATE SDL_MAIN_HANDLED)
 endif()
