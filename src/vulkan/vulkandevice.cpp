@@ -357,6 +357,8 @@ struct VulkanGlobals
 	bool32 commandReady;
 	int32 presentModePreference;
 	VkPresentModeKHR activePresentMode;
+	uint32 availablePresentModes;	// bit per VkPresentModeKHR (core modes only)
+	bool32 vsyncRequested;	// last FLIPWAITVSYNCH state passed to showRaster
 	bool32 swapchainRecreateRequested;
 	bool32 surfaceRecreateRequested;
 	bool32 appInBackground;
@@ -4310,11 +4312,17 @@ presentModeAvailable(VkPresentModeKHR *modes, uint32 count, VkPresentModeKHR mod
 	return 0;
 }
 
+// AUTO follows the game's vsync setting (the FLIPWAITVSYNCH flag of
+// showRaster): FIFO when it's on, the least blocking mode when it's off.
 static VkPresentModeKHR
 chooseAutoPresentMode(VkPresentModeKHR *modes, uint32 count)
 {
+	if(vkGlobals.vsyncRequested)
+		return VK_PRESENT_MODE_FIFO_KHR;
 	if(presentModeAvailable(modes, count, VK_PRESENT_MODE_MAILBOX_KHR))
 		return VK_PRESENT_MODE_MAILBOX_KHR;
+	if(presentModeAvailable(modes, count, VK_PRESENT_MODE_IMMEDIATE_KHR))
+		return VK_PRESENT_MODE_IMMEDIATE_KHR;
 	if(presentModeAvailable(modes, count, VK_PRESENT_MODE_FIFO_RELAXED_KHR))
 		return VK_PRESENT_MODE_FIFO_RELAXED_KHR;
 	return VK_PRESENT_MODE_FIFO_KHR;
@@ -4560,6 +4568,10 @@ createSwapchain(void)
 	vkGetPhysicalDeviceSurfacePresentModesKHR(ctx->physicalDevice, ctx->surface, &presentModeCount, presentModes);
 	VkPresentModeKHR presentMode = choosePresentMode(presentModes, presentModeCount);
 	vkGlobals.activePresentMode = presentMode;
+	vkGlobals.availablePresentModes = 0;
+	for(uint32 i = 0; i < presentModeCount; i++)
+		if((uint32)presentModes[i] < 32)
+			vkGlobals.availablePresentModes |= 1u << presentModes[i];
 	char presentModesText[192];
 	presentModesText[0] = '\0';
 	for(uint32 i = 0; i < presentModeCount; i++){
@@ -5284,6 +5296,25 @@ static void
 showRaster(Raster*, uint32 flags)
 {
 	Context *ctx = &vkGlobals.context;
+
+	// The present mode is fixed per swapchain, so a vsync change from the game
+	// takes effect by recreating it at the start of the next frame, and only
+	// when the resulting mode actually differs.
+	bool32 wantVsync = (flags & Raster::FLIPWAITVSYNCH) != 0;
+	if(vkGlobals.presentModePreference == PRESENT_MODE_AUTO && wantVsync != vkGlobals.vsyncRequested){
+		vkGlobals.vsyncRequested = wantVsync;
+		VkPresentModeKHR modes[4];
+		uint32 count = 0;
+		static const VkPresentModeKHR known[] = { VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR,
+			VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_FIFO_RELAXED_KHR };
+		for(uint32 i = 0; i < nelem(known); i++)
+			if(vkGlobals.availablePresentModes & (1u << known[i]))
+				modes[count++] = known[i];
+		if(ctx->swapchain != VK_NULL_HANDLE &&
+		   chooseAutoPresentMode(modes, count) != vkGlobals.activePresentMode)
+			vkGlobals.swapchainRecreateRequested = 1;
+	}
+
 	if(!ctx->frameStarted)
 		return;
 	finishFrameCommands();
