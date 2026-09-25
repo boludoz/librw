@@ -148,6 +148,9 @@ rasterCreate(Raster *raster)
 	natras->image = VK_NULL_HANDLE;
 	natras->imageMemory = VK_NULL_HANDLE;
 	memset(&natras->imageAlloc, 0, sizeof(natras->imageAlloc));
+	natras->framebuffer = VK_NULL_HANDLE;
+	natras->framebufferDepthView = VK_NULL_HANDLE;
+	natras->framebufferFormat = VK_FORMAT_UNDEFINED;
 	natras->imageView = VK_NULL_HANDLE;
 	natras->sampler = VK_NULL_HANDLE;
 	natras->descriptorSet = VK_NULL_HANDLE;
@@ -466,6 +469,9 @@ createNativeRaster(void *object, int32 offset, int32)
 	ras->image = VK_NULL_HANDLE;
 	ras->imageMemory = VK_NULL_HANDLE;
 	memset(&ras->imageAlloc, 0, sizeof(ras->imageAlloc));
+	ras->framebuffer = VK_NULL_HANDLE;
+	ras->framebufferDepthView = VK_NULL_HANDLE;
+	ras->framebufferFormat = VK_FORMAT_UNDEFINED;
 	ras->imageView = VK_NULL_HANDLE;
 	ras->sampler = VK_NULL_HANDLE;
 	ras->descriptorSet = VK_NULL_HANDLE;
@@ -497,6 +503,9 @@ copyNativeRaster(void *dst, void *, int32 offset, int32)
 	d->image = VK_NULL_HANDLE;
 	d->imageMemory = VK_NULL_HANDLE;
 	memset(&d->imageAlloc, 0, sizeof(d->imageAlloc));
+	d->framebuffer = VK_NULL_HANDLE;
+	d->framebufferDepthView = VK_NULL_HANDLE;
+	d->framebufferFormat = VK_FORMAT_UNDEFINED;
 	d->imageView = VK_NULL_HANDLE;
 	d->sampler = VK_NULL_HANDLE;
 	d->descriptorSet = VK_NULL_HANDLE;

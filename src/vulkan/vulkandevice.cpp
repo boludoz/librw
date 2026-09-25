@@ -128,6 +128,7 @@ struct TextureGarbage
 	VkImageView view;
 	VkSampler sampler;
 	VkDescriptorSet descriptorSet;
+	VkFramebuffer framebuffer;
 };
 
 struct GeometryGarbage
@@ -254,6 +255,16 @@ struct Lit3DUniforms
 	float fxParams[4];
 	float fogData[4];	// x=start, y=end, z=range, w=disable
 	float fogColor[4];
+	float custom[CUSTOM_UNIFORM_VEC4S][4];	// free for custom shaders
+};
+
+// Push constants of custom shaders: the lit3d ones plus one vec4 per mesh
+struct CustomPush
+{
+	float matColor[4];
+	float surfProps[4];
+	float alphaRef[4];
+	float custom[4];
 };
 
 enum PipelineKind
@@ -274,6 +285,7 @@ enum PipelineKind
 	PIPE_MATFX_ENVMAP_NOZWRITE,
 	PIPE_MATFX_ENVMAP_NOZTEST,
 	PIPE_MATFX_ENVMAP_NOZTEST_NOZWRITE,
+	PIPE_CUSTOM,	// layout only; pipelines live in each CustomShader
 	PIPE_COUNT
 };
 
@@ -432,7 +444,26 @@ struct VulkanGlobals
 	VkFormat pipelineDepthFormat;
 	Camera *viewProjCamera;
 	RawMatrix camViewProj;
+	// render pass currently recording: none, the swapchain or a camera texture
+	int32 activePass;
+	Raster *offscreenTarget;
+	Raster *offscreenDepth;
+	VkRenderPass offscreenRenderPass;
+	Raster *offscreenClearRaster;	// clear requested before its pass began
+	RGBA offscreenClearColor;
+	uint32 offscreenClearMode;
+	CustomShader *customShaders;	// every live custom shader
+	struct {
+		CustomShader *shader;
+		InstanceDataHeader *header;
+		Geometry *geometry;
+		int32 zmode;
+		PrimitiveType primType;
+		Lit3DPush push;
+	} custom;
 };
+
+enum { PASS_NONE, PASS_SWAPCHAIN, PASS_OFFSCREEN };
 
 static VulkanGlobals vkGlobals;
 
@@ -456,7 +487,7 @@ static void copyIdentity(float *m);
 static void queueTextureUpload(Raster *raster);
 static void removeTextureUploadGarbageForRaster(Raster *raster);
 static void destroyTextureHandles(VkImage *image, VkDeviceMemory *memory, VulkanAllocation *alloc, VkImageView *view, VkSampler *sampler);
-static bool32 keepTextureGarbage(uint32 frame, VkImage image, VkDeviceMemory memory, VulkanAllocation *alloc, VkImageView view, VkSampler sampler, VkDescriptorSet descriptorSet);
+static bool32 keepTextureGarbage(uint32 frame, VkImage image, VkDeviceMemory memory, VulkanAllocation *alloc, VkImageView view, VkSampler sampler, VkDescriptorSet descriptorSet, VkFramebuffer framebuffer = VK_NULL_HANDLE);
 static bool32 keepGeometryGarbage(uint32 frame, VulkanAllocation *alloc);
 static uint32 garbageFrame(void);
 static bool32 retireBufferToFrame(uint32 frame, VulkanBuffer *buffer);
@@ -1879,11 +1910,13 @@ retireRasterGpuTexture(VulkanRaster *natras)
 	Context *ctx = &vkGlobals.context;
 	if(natras->image != VK_NULL_HANDLE || natras->imageMemory != VK_NULL_HANDLE ||
 	   gpuAllocValid(&natras->imageAlloc) || natras->imageView != VK_NULL_HANDLE ||
-	   natras->descriptorSet != VK_NULL_HANDLE){
+	   natras->descriptorSet != VK_NULL_HANDLE || natras->framebuffer != VK_NULL_HANDLE){
 		if(!keepTextureGarbage(garbageFrame(), natras->image, natras->imageMemory, &natras->imageAlloc,
-			natras->imageView, natras->sampler, natras->descriptorSet)){
+			natras->imageView, natras->sampler, natras->descriptorSet, natras->framebuffer)){
 			if(ctx->device != VK_NULL_HANDLE)
 				vkDeviceWaitIdle(ctx->device);
+			if(natras->framebuffer != VK_NULL_HANDLE)
+				vkDestroyFramebuffer(ctx->device, natras->framebuffer, nil);
 			if(natras->descriptorSet != VK_NULL_HANDLE && vkGlobals.descriptorPool != VK_NULL_HANDLE)
 				vkFreeDescriptorSets(ctx->device, vkGlobals.descriptorPool, 1, &natras->descriptorSet);
 			destroyTextureHandles(&natras->image, &natras->imageMemory, &natras->imageAlloc,
@@ -1896,6 +1929,9 @@ retireRasterGpuTexture(VulkanRaster *natras)
 	natras->imageView = VK_NULL_HANDLE;
 	natras->sampler = VK_NULL_HANDLE;
 	natras->descriptorSet = VK_NULL_HANDLE;
+	natras->framebuffer = VK_NULL_HANDLE;
+	natras->framebufferDepthView = VK_NULL_HANDLE;
+	natras->framebufferFormat = VK_FORMAT_UNDEFINED;
 }
 
 void
@@ -1916,6 +1952,8 @@ destroyRasterTexture(Raster *raster)
 		i++;
 	}
 	removeTextureUploadGarbageForRaster(raster);
+	if(vkGlobals.offscreenClearRaster == raster)
+		vkGlobals.offscreenClearRaster = nil;
 	VulkanRaster *natras = GETVULKANRASTEREXT(raster);
 	retireRasterGpuTexture(natras);
 	natras->descriptorSet = VK_NULL_HANDLE;
@@ -2049,7 +2087,7 @@ retireBufferToFrame(uint32 frame, VulkanBuffer *buffer)
 
 static bool32
 keepTextureGarbage(uint32 frame, VkImage image, VkDeviceMemory memory, VulkanAllocation *alloc,
-	VkImageView view, VkSampler sampler, VkDescriptorSet descriptorSet)
+	VkImageView view, VkSampler sampler, VkDescriptorSet descriptorSet, VkFramebuffer framebuffer)
 {
 	if(frame >= MAX_FRAMES_IN_FLIGHT)
 		return 0;
@@ -2068,6 +2106,7 @@ keepTextureGarbage(uint32 frame, VkImage image, VkDeviceMemory memory, VulkanAll
 	t->view = view;
 	t->sampler = sampler;
 	t->descriptorSet = descriptorSet;
+	t->framebuffer = framebuffer;
 	return 1;
 }
 
@@ -2103,6 +2142,8 @@ retireTextureUploadGarbage(uint32 frame)
 	garbage->numStaging = 0;
 
 	for(uint32 i = 0; i < garbage->numTextures; i++){
+		if(garbage->textures[i].framebuffer != VK_NULL_HANDLE && vkGlobals.context.device != VK_NULL_HANDLE)
+			vkDestroyFramebuffer(vkGlobals.context.device, garbage->textures[i].framebuffer, nil);
 		if(garbage->textures[i].descriptorSet != VK_NULL_HANDLE &&
 		   vkGlobals.descriptorPool != VK_NULL_HANDLE && vkGlobals.context.device != VK_NULL_HANDLE)
 			vkFreeDescriptorSets(vkGlobals.context.device, vkGlobals.descriptorPool, 1,
@@ -2794,6 +2835,7 @@ selectLit3DPipelineKind(void)
 
 static bool32 createDrawPipelines(void);
 static void destroyDrawPipelines(void);
+static void destroyAllCustomShaderPipelines(bool32 modulesToo);
 static void resetCommandBindings(void);
 static void destroyDrawResources(void);
 static void destroyInstanceGpuBuffers(InstanceDataHeader *header);
@@ -3092,6 +3134,53 @@ createMatFXPipelineLayout(PipelineKind kind)
 	            "vkCreatePipelineLayout(matfx)");
 }
 
+// Vertex layout of Im3DVertex, used by color3d, lit3d, matfx and custom shaders
+static void
+makeIm3DVertexInput(VkVertexInputBindingDescription *binding, VkVertexInputAttributeDescription *attribs)
+{
+	memset(binding, 0, sizeof(*binding));
+	binding->binding = 0;
+	binding->stride = sizeof(Im3DVertex);
+	binding->inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+	memset(attribs, 0, sizeof(*attribs)*4);
+	attribs[0].location = 0;
+	attribs[0].binding = 0;
+	attribs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+	attribs[0].offset = offsetof(Im3DVertex, position);
+	attribs[1].location = 1;
+	attribs[1].binding = 0;
+	attribs[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+	attribs[1].offset = offsetof(Im3DVertex, normal);
+	attribs[2].location = 2;
+	attribs[2].binding = 0;
+	attribs[2].format = VK_FORMAT_R8G8B8A8_UNORM;
+	attribs[2].offset = offsetof(Im3DVertex, r);
+	attribs[3].location = 3;
+	attribs[3].binding = 0;
+	attribs[3].format = VK_FORMAT_R32G32_SFLOAT;
+	attribs[3].offset = offsetof(Im3DVertex, u);
+}
+
+static bool32
+createCustomPipelineLayout(void)
+{
+	Context *ctx = &vkGlobals.context;
+	VkPushConstantRange pushRange;
+	memset(&pushRange, 0, sizeof(pushRange));
+	pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+	pushRange.size = sizeof(CustomPush);
+	VkPipelineLayoutCreateInfo layoutInfo;
+	memset(&layoutInfo, 0, sizeof(layoutInfo));
+	layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	VkDescriptorSetLayout layouts[3] = { vkGlobals.textureSetLayout, vkGlobals.litSetLayout, vkGlobals.textureSetLayout };
+	layoutInfo.setLayoutCount = 3;
+	layoutInfo.pSetLayouts = layouts;
+	layoutInfo.pushConstantRangeCount = 1;
+	layoutInfo.pPushConstantRanges = &pushRange;
+	return vkOk(vkCreatePipelineLayout(ctx->device, &layoutInfo, nil, &vkGlobals.pipelineLayouts[PIPE_CUSTOM]),
+	            "vkCreatePipelineLayout(custom)");
+}
+
 // createDrawPipelines() creates every (kind x blend x primType) permutation up
 // front - a few hundred vkCreateGraphicsPipelines calls on a cold cache. A
 // VkPipelineCache shared across all of them lets the driver skip redundant
@@ -3189,7 +3278,8 @@ static bool32
 createGraphicsPipeline(PipelineKind kind, BlendPipelineMode blendMode, PrimitiveType primType,
 	VkShaderModule vertShader, VkShaderModule fragShader,
 	VkVertexInputBindingDescription *bindingDesc,
-	VkVertexInputAttributeDescription *attribDescs, uint32 attribCount)
+	VkVertexInputAttributeDescription *attribDescs, uint32 attribCount,
+	VkPipelineLayout layout = VK_NULL_HANDLE, VkPipeline *out = nil)
 {
 	Context *ctx = &vkGlobals.context;
 	if(vertShader == VK_NULL_HANDLE || fragShader == VK_NULL_HANDLE)
@@ -3300,12 +3390,12 @@ createGraphicsPipeline(PipelineKind kind, BlendPipelineMode blendMode, Primitive
 	pipelineInfo.pDepthStencilState = &depthStencil;
 	pipelineInfo.pColorBlendState = &colorBlending;
 	pipelineInfo.pDynamicState = &dynamicState;
-	pipelineInfo.layout = vkGlobals.pipelineLayouts[kind];
+	pipelineInfo.layout = layout != VK_NULL_HANDLE ? layout : vkGlobals.pipelineLayouts[kind];
 	pipelineInfo.renderPass = ctx->renderPass;
 	pipelineInfo.subpass = 0;
 
 	return vkOk(vkCreateGraphicsPipelines(ctx->device, ctx->pipelineCache, 1, &pipelineInfo, nil,
-		&vkGlobals.pipelines[kind][blendMode][primType]), "vkCreateGraphicsPipelines");
+		out ? out : &vkGlobals.pipelines[kind][blendMode][primType]), "vkCreateGraphicsPipelines");
 }
 
 static bool32
@@ -3326,7 +3416,8 @@ createDrawPipelines(void)
 	   !createMatFXPipelineLayout(PIPE_MATFX_ENVMAP) ||
 	   !createMatFXPipelineLayout(PIPE_MATFX_ENVMAP_NOZWRITE) ||
 	   !createMatFXPipelineLayout(PIPE_MATFX_ENVMAP_NOZTEST) ||
-	   !createMatFXPipelineLayout(PIPE_MATFX_ENVMAP_NOZTEST_NOZWRITE))
+	   !createMatFXPipelineLayout(PIPE_MATFX_ENVMAP_NOZTEST_NOZWRITE) ||
+	   !createCustomPipelineLayout())
 		return 0;
 
 	VkVertexInputBindingDescription im2dBinding;
@@ -3350,28 +3441,8 @@ createDrawPipelines(void)
 	im2dAttribs[2].offset = offsetof(Im2DVertex, u);
 
 	VkVertexInputBindingDescription color3dBinding;
-	memset(&color3dBinding, 0, sizeof(color3dBinding));
-	color3dBinding.binding = 0;
-	color3dBinding.stride = sizeof(Im3DVertex);
-	color3dBinding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 	VkVertexInputAttributeDescription color3dAttribs[4];
-	memset(color3dAttribs, 0, sizeof(color3dAttribs));
-	color3dAttribs[0].location = 0;
-	color3dAttribs[0].binding = 0;
-	color3dAttribs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-	color3dAttribs[0].offset = offsetof(Im3DVertex, position);
-	color3dAttribs[1].location = 1;
-	color3dAttribs[1].binding = 0;
-	color3dAttribs[1].format = VK_FORMAT_R32G32B32_SFLOAT;
-	color3dAttribs[1].offset = offsetof(Im3DVertex, normal);
-	color3dAttribs[2].location = 2;
-	color3dAttribs[2].binding = 0;
-	color3dAttribs[2].format = VK_FORMAT_R8G8B8A8_UNORM;
-	color3dAttribs[2].offset = offsetof(Im3DVertex, r);
-	color3dAttribs[3].location = 3;
-	color3dAttribs[3].binding = 0;
-	color3dAttribs[3].format = VK_FORMAT_R32G32_SFLOAT;
-	color3dAttribs[3].offset = offsetof(Im3DVertex, u);
+	makeIm3DVertexInput(&color3dBinding, color3dAttribs);
 
 	PrimitiveType prims[] = {
 		PRIMTYPELINELIST, PRIMTYPEPOLYLINE, PRIMTYPETRILIST,
@@ -3534,6 +3605,7 @@ destroyDrawPipelines(void)
 			vkGlobals.pipelineLayouts[k] = VK_NULL_HANDLE;
 		}
 	}
+	destroyAllCustomShaderPipelines(0);
 	vkGlobals.pipelineColorFormat = VK_FORMAT_UNDEFINED;
 	vkGlobals.pipelineDepthFormat = VK_FORMAT_UNDEFINED;
 	resetCommandBindings();
@@ -3581,6 +3653,7 @@ destroyDrawResources(void)
 	if(ctx->device == VK_NULL_HANDLE)
 		return;
 	destroyDrawPipelines();
+	destroyAllCustomShaderPipelines(1);
 	destroyPipelineCache();
 	// release the GPU buffers of all instanced geometries; the CPU side
 	// stays so they can be instanced again if the device comes back.
@@ -4535,10 +4608,75 @@ createOneRenderPass(VkAttachmentLoadOp colorLoadOp, VkAttachmentLoadOp depthLoad
 	return vkOk(vkCreateRenderPass(ctx->device, &createInfo, nil, renderPass), "vkCreateRenderPass");
 }
 
+// Render pass for camera textures. Compatible with the swapchain passes (same
+// attachment formats), so every draw pipeline works in it too. The color
+// target ends up shader readable.
+static bool32
+createOffscreenRenderPass(void)
+{
+	Context *ctx = &vkGlobals.context;
+	VkAttachmentDescription attachments[2];
+	memset(attachments, 0, sizeof(attachments));
+	attachments[0].format = ctx->swapchainFormat;
+	attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+	attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+	attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachments[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	attachments[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	attachments[1].format = ctx->depthFormat;
+	attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+	attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+	attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+	attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+	VkAttachmentReference colorRef = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+	VkAttachmentReference depthRef = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+	VkSubpassDescription subpass;
+	memset(&subpass, 0, sizeof(subpass));
+	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments = &colorRef;
+	subpass.pDepthStencilAttachment = &depthRef;
+
+	VkSubpassDependency deps[2];
+	memset(deps, 0, sizeof(deps));
+	deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+	deps[0].dstSubpass = 0;
+	deps[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+	deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+	deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+	// the texture is sampled right after the pass
+	deps[1].srcSubpass = 0;
+	deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+	deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+	VkRenderPassCreateInfo createInfo;
+	memset(&createInfo, 0, sizeof(createInfo));
+	createInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	createInfo.attachmentCount = 2;
+	createInfo.pAttachments = attachments;
+	createInfo.subpassCount = 1;
+	createInfo.pSubpasses = &subpass;
+	createInfo.dependencyCount = 2;
+	createInfo.pDependencies = deps;
+	return vkOk(vkCreateRenderPass(ctx->device, &createInfo, nil, &vkGlobals.offscreenRenderPass),
+		"vkCreateRenderPass(offscreen)");
+}
+
 static bool32
 createRenderPass(void)
 {
 	Context *ctx = &vkGlobals.context;
+	if(!createOffscreenRenderPass())
+		return 0;
 	return createOneRenderPass(VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_LOAD_OP_CLEAR,
 		VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_UNDEFINED, &ctx->renderPass) &&
 	       createOneRenderPass(VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_LOAD_OP_LOAD,
@@ -4752,6 +4890,10 @@ destroySwapchain(void)
 	if(ctx->loadRenderPass != VK_NULL_HANDLE){
 		vkDestroyRenderPass(ctx->device, ctx->loadRenderPass, nil);
 		ctx->loadRenderPass = VK_NULL_HANDLE;
+	}
+	if(vkGlobals.offscreenRenderPass != VK_NULL_HANDLE){
+		vkDestroyRenderPass(ctx->device, vkGlobals.offscreenRenderPass, nil);
+		vkGlobals.offscreenRenderPass = VK_NULL_HANDLE;
 	}
 	destroyDepthResources();
 	if(ctx->swapchainImageViews){
@@ -4976,6 +5118,7 @@ beginSwapchainRenderPass(VkRenderPass renderPass, VkFramebuffer framebuffer, boo
 	rpInfo.clearValueCount = clear ? nelem(clearValues) : 0;
 	rpInfo.pClearValues = clear ? clearValues : nil;
 	vkCmdBeginRenderPass(ctx->commandBuffers[ctx->currentFrame], &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
+	vkGlobals.activePass = PASS_SWAPCHAIN;
 	setSwapchainViewportAndScissor();
 	resetCommandBindings();
 }
@@ -5141,6 +5284,248 @@ rasterViewportRect(Raster *raster, VkRect2D *rect)
 	rect->extent.height = (uint32)h;
 }
 
+static bool32 rasterCopyTargetReady(Raster *raster);
+
+static void
+imageBarrier(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect,
+	VkImageLayout oldLayout, VkImageLayout newLayout,
+	VkPipelineStageFlags srcStage, VkAccessFlags srcAccess,
+	VkPipelineStageFlags dstStage, VkAccessFlags dstAccess)
+{
+	VkImageMemoryBarrier barrier;
+	memset(&barrier, 0, sizeof(barrier));
+	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	barrier.oldLayout = oldLayout;
+	barrier.newLayout = newLayout;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image = image;
+	barrier.subresourceRange.aspectMask = aspect;
+	barrier.subresourceRange.levelCount = 1;
+	barrier.subresourceRange.layerCount = 1;
+	barrier.srcAccessMask = srcAccess;
+	barrier.dstAccessMask = dstAccess;
+	vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nil, 0, nil, 1, &barrier);
+}
+
+// Depth image for a ZBUFFER raster used as a camera texture's depth buffer
+static bool32
+depthTargetReady(Raster *raster)
+{
+	Context *ctx = &vkGlobals.context;
+	VulkanRaster *natras = GETVULKANRASTEREXT(raster);
+	if(natras->image != VK_NULL_HANDLE && natras->imageFormat == ctx->depthFormat)
+		return 1;
+	destroyRasterTexture(raster);
+
+	VkImageCreateInfo imageInfo;
+	memset(&imageInfo, 0, sizeof(imageInfo));
+	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.extent.width = (uint32)raster->width;
+	imageInfo.extent.height = (uint32)raster->height;
+	imageInfo.extent.depth = 1;
+	imageInfo.mipLevels = 1;
+	imageInfo.arrayLayers = 1;
+	imageInfo.format = ctx->depthFormat;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	if(!vkOk(vkCreateImage(ctx->device, &imageInfo, nil, &natras->image), "vkCreateImage(camera depth)"))
+		return 0;
+	VkMemoryRequirements req;
+	vkGetImageMemoryRequirements(ctx->device, natras->image, &req);
+	if(!gpuAlloc(GPU_HEAP_IMAGE, req.size, req.alignment, req.memoryTypeBits, &natras->imageAlloc) ||
+	   !vkOk(vkBindImageMemory(ctx->device, natras->image, ((GpuBlock*)natras->imageAlloc.block)->memory,
+		natras->imageAlloc.offset), "vkBindImageMemory(camera depth)")){
+		destroyRasterTexture(raster);
+		return 0;
+	}
+	VkImageViewCreateInfo viewInfo;
+	memset(&viewInfo, 0, sizeof(viewInfo));
+	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image = natras->image;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	viewInfo.format = ctx->depthFormat;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.layerCount = 1;
+	if(!vkOk(vkCreateImageView(ctx->device, &viewInfo, nil, &natras->imageView), "vkCreateImageView(camera depth)")){
+		destroyRasterTexture(raster);
+		return 0;
+	}
+	natras->imageFormat = ctx->depthFormat;
+	natras->imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	natras->gpuReady = 1;
+	natras->gpuDirty = 0;
+	return 1;
+}
+
+static bool32
+offscreenTargetReady(Raster *color, Raster *depth)
+{
+	Context *ctx = &vkGlobals.context;
+	if(color == nil || depth == nil || vkGlobals.offscreenRenderPass == VK_NULL_HANDLE)
+		return 0;
+	if(depth->width < color->width || depth->height < color->height)
+		return 0;
+	if(!rasterCopyTargetReady(color) || !depthTargetReady(depth))
+		return 0;
+	VulkanRaster *natcol = GETVULKANRASTEREXT(color);
+	VulkanRaster *natdep = GETVULKANRASTEREXT(depth);
+	if(natcol->framebuffer != VK_NULL_HANDLE &&
+	   natcol->framebufferDepthView == natdep->imageView &&
+	   natcol->framebufferFormat == ctx->swapchainFormat)
+		return 1;
+	if(natcol->framebuffer != VK_NULL_HANDLE &&
+	   !keepTextureGarbage(garbageFrame(), VK_NULL_HANDLE, VK_NULL_HANDLE, nil, VK_NULL_HANDLE,
+		VK_NULL_HANDLE, VK_NULL_HANDLE, natcol->framebuffer))
+		return 0;
+	natcol->framebuffer = VK_NULL_HANDLE;
+
+	VkImageView attachments[] = { natcol->imageView, natdep->imageView };
+	VkFramebufferCreateInfo fbInfo;
+	memset(&fbInfo, 0, sizeof(fbInfo));
+	fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+	fbInfo.renderPass = vkGlobals.offscreenRenderPass;
+	fbInfo.attachmentCount = 2;
+	fbInfo.pAttachments = attachments;
+	fbInfo.width = (uint32)color->width;
+	fbInfo.height = (uint32)color->height;
+	fbInfo.layers = 1;
+	if(!vkOk(vkCreateFramebuffer(ctx->device, &fbInfo, nil, &natcol->framebuffer), "vkCreateFramebuffer(camera)"))
+		return 0;
+	natcol->framebufferDepthView = natdep->imageView;
+	natcol->framebufferFormat = ctx->swapchainFormat;
+	return 1;
+}
+
+static void
+clearActiveAttachments(const VkRect2D *area, RGBA *col, uint32 mode)
+{
+	Context *ctx = &vkGlobals.context;
+	VkClearRect rect;
+	memset(&rect, 0, sizeof(rect));
+	rect.rect = *area;
+	rect.layerCount = 1;
+	RGBAf c;
+	convColor(&c, col);
+	VkClearAttachment atts[2];
+	memset(atts, 0, sizeof(atts));
+	uint32 n = 0;
+	if(mode & Camera::CLEARIMAGE){
+		atts[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		atts[n].colorAttachment = 0;
+		atts[n].clearValue.color.float32[0] = c.red;
+		atts[n].clearValue.color.float32[1] = c.green;
+		atts[n].clearValue.color.float32[2] = c.blue;
+		atts[n].clearValue.color.float32[3] = c.alpha;
+		n++;
+	}
+	if(mode & Camera::CLEARZ){
+		atts[n].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+		atts[n].clearValue.depthStencil.depth = 1.0f;
+		n++;
+	}
+	if(n && area->extent.width && area->extent.height)
+		vkCmdClearAttachments(ctx->commandBuffers[ctx->currentFrame], n, atts, 1, &rect);
+}
+
+// End whatever render pass is recording; a camera texture becomes readable.
+static void
+endActivePass(void)
+{
+	Context *ctx = &vkGlobals.context;
+	if(vkGlobals.activePass == PASS_NONE)
+		return;
+	vkCmdEndRenderPass(ctx->commandBuffers[ctx->currentFrame]);
+	if(vkGlobals.activePass == PASS_OFFSCREEN){
+		GETVULKANRASTEREXT(vkGlobals.offscreenTarget)->imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		GETVULKANRASTEREXT(vkGlobals.offscreenDepth)->imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+		vkGlobals.offscreenTarget = nil;
+		vkGlobals.offscreenDepth = nil;
+	}
+	vkGlobals.activePass = PASS_NONE;
+	resetCommandBindings();
+}
+
+// Continue drawing to the swapchain image after a camera texture pass
+static void
+resumeSwapchainPass(void)
+{
+	Context *ctx = &vkGlobals.context;
+	if(vkGlobals.activePass == PASS_SWAPCHAIN)
+		return;
+	endActivePass();
+	// the last swapchain pass left the image ready for presenting
+	imageBarrier(ctx->commandBuffers[ctx->currentFrame], ctx->swapchainImages[ctx->currentImage],
+		VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+	beginSwapchainRenderPass(ctx->loadRenderPass, ctx->loadFramebuffers[ctx->currentImage], 0);
+}
+
+// Start rendering into a camera texture (e.g. the vehicle environment map)
+static void
+beginOffscreenPass(Camera *cam)
+{
+	Context *ctx = &vkGlobals.context;
+	if(!beginFrame())
+		return;
+	endActivePass();
+	Raster *color = cam->frameBuffer;
+	Raster *depth = cam->zBuffer;
+	if(!offscreenTargetReady(color, depth))
+		return;	// no pass active: draws are skipped until the next camera
+
+	VkCommandBuffer cmd = ctx->commandBuffers[ctx->currentFrame];
+	VulkanRaster *natcol = GETVULKANRASTEREXT(color);
+	VulkanRaster *natdep = GETVULKANRASTEREXT(depth);
+	imageBarrier(cmd, natcol->image, VK_IMAGE_ASPECT_COLOR_BIT,
+		natcol->imageLayout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+	imageBarrier(cmd, natdep->image, VK_IMAGE_ASPECT_DEPTH_BIT,
+		natdep->imageLayout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+		VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+		VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+		VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+		VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+
+	VkRenderPassBeginInfo rpInfo;
+	memset(&rpInfo, 0, sizeof(rpInfo));
+	rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	rpInfo.renderPass = vkGlobals.offscreenRenderPass;
+	rpInfo.framebuffer = natcol->framebuffer;
+	rpInfo.renderArea.extent.width = (uint32)color->width;
+	rpInfo.renderArea.extent.height = (uint32)color->height;
+	vkCmdBeginRenderPass(cmd, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
+	vkGlobals.activePass = PASS_OFFSCREEN;
+	vkGlobals.offscreenTarget = color;
+	vkGlobals.offscreenDepth = depth;
+	resetCommandBindings();
+
+	VkViewport viewport;
+	viewport.x = 0.0f;
+	viewport.y = 0.0f;
+	viewport.width = (float)color->width;
+	viewport.height = (float)color->height;
+	viewport.minDepth = 0.0f;
+	viewport.maxDepth = 1.0f;
+	vkCmdSetViewport(cmd, 0, 1, &viewport);
+	vkCmdSetScissor(cmd, 0, 1, &rpInfo.renderArea);
+
+	if(vkGlobals.offscreenClearRaster == color){
+		clearActiveAttachments(&rpInfo.renderArea, &vkGlobals.offscreenClearColor, vkGlobals.offscreenClearMode);
+		vkGlobals.offscreenClearRaster = nil;
+	}
+}
+
 static void
 beginUpdate(Camera *cam)
 {
@@ -5201,10 +5586,13 @@ beginUpdate(Camera *cam)
 	vkGlobals.viewProjCamera = cam;
 
 	engine->currentCamera = cam;
-	if(cam->frameBuffer && cam->frameBuffer->type == Raster::CAMERATEXTURE)
+	if(cam->frameBuffer && cam->frameBuffer->type == Raster::CAMERATEXTURE){
+		beginOffscreenPass(cam);
 		return;
+	}
 	if(!beginFrame())
 		return;
+	resumeSwapchainPass();
 
 	// Point viewport and scissor at the camera raster's rect so
 	// rendering to sub-rasters only touches their region.
@@ -5230,7 +5618,7 @@ finishFrameCommands(void)
 	Context *ctx = &vkGlobals.context;
 	if(!ctx->frameStarted || vkGlobals.commandReady)
 		return;
-	vkCmdEndRenderPass(ctx->commandBuffers[ctx->currentFrame]);
+	endActivePass();
 	vkOk(vkEndCommandBuffer(ctx->commandBuffers[ctx->currentFrame]), "vkEndCommandBuffer");
 	vkGlobals.commandReady = 1;
 }
@@ -5239,17 +5627,36 @@ static void
 endUpdate(Camera *cam)
 {
 	// Cameras can be updated several times per frame (e.g. sub-rasters),
-	// so command recording only finishes in showRaster.
+	// so command recording only finishes in showRaster. A camera texture's
+	// pass ends here so the texture can be sampled afterwards.
+	if(cam && cam->frameBuffer && vkGlobals.activePass == PASS_OFFSCREEN &&
+	   vkGlobals.offscreenTarget == cam->frameBuffer)
+		endActivePass();
 }
 
 static void
 clearCamera(Camera *cam, RGBA *col, uint32 mode)
 {
+	if(cam && cam->frameBuffer && cam->frameBuffer->type == Raster::CAMERATEXTURE){
+		Raster *fb = cam->frameBuffer;
+		if(vkGlobals.activePass == PASS_OFFSCREEN && vkGlobals.offscreenTarget == fb){
+			VkRect2D area;
+			area.offset.x = 0;
+			area.offset.y = 0;
+			area.extent.width = (uint32)fb->width;
+			area.extent.height = (uint32)fb->height;
+			clearActiveAttachments(&area, col, mode);
+		}else{
+			// cameras are usually cleared before their update begins
+			vkGlobals.offscreenClearRaster = fb;
+			vkGlobals.offscreenClearColor = *col;
+			vkGlobals.offscreenClearMode = mode;
+		}
+		return;
+	}
+
 	vkGlobals.clearColor = *col;
 	vkGlobals.clearMode = mode;
-
-	if(cam && cam->frameBuffer && cam->frameBuffer->type == Raster::CAMERATEXTURE)
-		return;
 
 	Context *ctx = &vkGlobals.context;
 	bool32 opensFrame = !ctx->frameStarted;
@@ -5260,36 +5667,10 @@ clearCamera(Camera *cam, RGBA *col, uint32 mode)
 	if(opensFrame)
 		return;
 
-	VkClearRect rect;
-	memset(&rect, 0, sizeof(rect));
-	rasterViewportRect(cam ? cam->frameBuffer : nil, &rect.rect);
-	if(rect.rect.extent.width == 0 || rect.rect.extent.height == 0)
-		return;
-	rect.baseArrayLayer = 0;
-	rect.layerCount = 1;
-
-	RGBAf c;
-	convColor(&c, col);
-	VkClearAttachment atts[2];
-	memset(atts, 0, sizeof(atts));
-	uint32 n = 0;
-	if(mode & Camera::CLEARIMAGE){
-		atts[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		atts[n].colorAttachment = 0;
-		atts[n].clearValue.color.float32[0] = c.red;
-		atts[n].clearValue.color.float32[1] = c.green;
-		atts[n].clearValue.color.float32[2] = c.blue;
-		atts[n].clearValue.color.float32[3] = c.alpha;
-		n++;
-	}
-	if(mode & Camera::CLEARZ){
-		atts[n].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-		atts[n].clearValue.depthStencil.depth = 1.0f;
-		atts[n].clearValue.depthStencil.stencil = 0;
-		n++;
-	}
-	if(n)
-		vkCmdClearAttachments(ctx->commandBuffers[ctx->currentFrame], n, atts, 1, &rect);
+	resumeSwapchainPass();
+	VkRect2D area;
+	rasterViewportRect(cam ? cam->frameBuffer : nil, &area);
+	clearActiveAttachments(&area, col, mode);
 }
 
 static void
@@ -5376,7 +5757,7 @@ rasterCopyTargetReady(Raster *raster)
 
 	destroyRasterTexture(raster);
 	if(!createEmptySampledImage((uint32)raster->width, (uint32)raster->height, ctx->swapchainFormat,
-		VK_IMAGE_USAGE_TRANSFER_DST_BIT, &natras->image, &natras->imageMemory,
+		VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, &natras->image, &natras->imageMemory,
 		&natras->imageView, &natras->sampler, &natras->descriptorSet)){
 		destroyRasterTexture(raster);
 		return 0;
@@ -5397,7 +5778,8 @@ rasterRenderFast(Raster *raster, int32 x, int32 y)
 	Raster *dst = Raster::getCurrentContext();
 	if(src == nil || dst == nil || src->type != Raster::CAMERA)
 		return 0;
-	if(!ctx->frameStarted || vkGlobals.commandReady || !vkGlobals.canCopyFromSwapchain)
+	if(!ctx->frameStarted || vkGlobals.commandReady || !vkGlobals.canCopyFromSwapchain ||
+	   vkGlobals.activePass != PASS_SWAPCHAIN)
 		return 0;
 	if(x < 0 || y < 0 || x >= dst->width || y >= dst->height)
 		return 0;
@@ -5419,8 +5801,7 @@ rasterRenderFast(Raster *raster, int32 x, int32 y)
 		return 0;
 
 	VkCommandBuffer commandBuffer = ctx->commandBuffers[ctx->currentFrame];
-	vkCmdEndRenderPass(commandBuffer);
-	resetCommandBindings();
+	endActivePass();
 
 	transitionImageLayout(commandBuffer, ctx->swapchainImages[ctx->currentImage],
 		VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -5484,7 +5865,8 @@ static bool32
 validDrawState(PipelineKind kind, PrimitiveType primType)
 {
 	Context *ctx = &vkGlobals.context;
-	if(!ctx->frameStarted || primType <= PRIMTYPENONE || primType >= MAX_PRIM_PIPELINES)
+	if(!ctx->frameStarted || vkGlobals.activePass == PASS_NONE ||
+	   primType <= PRIMTYPENONE || primType >= MAX_PRIM_PIPELINES)
 		return 0;
 	return vkGlobals.pipelineLayouts[kind] != VK_NULL_HANDLE;
 }
@@ -6731,27 +7113,14 @@ makeDefaultPipeline(void)
 	return pipe;
 }
 
-static void
-skinRenderCB(Atomic *atomic)
+// CPU skin an atomic into this frame's vertex buffer and bind it. Colors,
+// texture coordinates, indices and the per-mesh data don't change with the
+// pose, so they come from the instanced copy; only positions and normals
+// are skinned.
+static bool32
+bindSkinnedVertices(Atomic *atomic, InstanceDataHeader *header)
 {
 	Geometry *geo = atomic->geometry;
-	if(geo == nil || geo->numVertices <= 0 || geo->meshHeader == nil)
-		return;
-
-	// Colors, texture coordinates, indices and the per-mesh data don't change
-	// with the pose, so they come from the instanced copy; only positions and
-	// normals are skinned each frame.
-	InstanceDataHeader *header = ensureInstanced(atomic);
-	if(header == nil || header->numMeshes == 0 || header->vertices == nil)
-		return;
-
-	PrimitiveType primType = (PrimitiveType)header->primType;
-	PipelineKind k = selectLit3DPipelineKind();
-	if(!validDrawState(k, primType))
-		return;
-	if(!ensureLitUniformResources())
-		return;
-
 	Skin *skin = Skin::get(geo);
 	HAnimHierarchy *hier = skin ? Skin::getHierarchy(atomic) : nil;
 
@@ -6792,7 +7161,7 @@ skinRenderCB(Atomic *atomic)
 	Im3DVertex *dst = (Im3DVertex*)allocDynamicBuffer(vertexBuffer, &vkGlobals.dynamicVertexOffset,
 		(VkDeviceSize)numVertices * sizeof(Im3DVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 16, &vertexOffset);
 	if(dst == nil)
-		return;
+		return 0;
 
 	const Im3DVertex *src = header->vertices;
 	bool32 canSkin = skin && skin->weights && skin->indices && numBones > 0 &&
@@ -6846,6 +7215,36 @@ skinRenderCB(Atomic *atomic)
 		dst[i] = v;
 	}
 
+	vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer->buffer, &vertexOffset);
+	return 1;
+}
+
+static void
+skinRenderCB(Atomic *atomic)
+{
+	Geometry *geo = atomic->geometry;
+	if(geo == nil || geo->numVertices <= 0 || geo->meshHeader == nil)
+		return;
+
+	// Colors, texture coordinates, indices and the per-mesh data don't change
+	// with the pose, so they come from the instanced copy; only positions and
+	// normals are skinned each frame.
+	InstanceDataHeader *header = ensureInstanced(atomic);
+	if(header == nil || header->numMeshes == 0 || header->vertices == nil)
+		return;
+
+	PrimitiveType primType = (PrimitiveType)header->primType;
+	PipelineKind k = selectLit3DPipelineKind();
+	if(!validDrawState(k, primType))
+		return;
+	if(!ensureLitUniformResources())
+		return;
+
+	Context *ctx = &vkGlobals.context;
+	VkCommandBuffer cmd = ctx->commandBuffers[ctx->currentFrame];
+	if(!bindSkinnedVertices(atomic, header))
+		return;
+
 	// Set up lit3d uniforms once for the whole atomic
 	Lit3DUniforms u;
 	Lit3DPush p;
@@ -6854,12 +7253,244 @@ skinRenderCB(Atomic *atomic)
 	if(!uploadLitUniforms(&u, &dynamicOffset))
 		return;
 
-	vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer->buffer, &vertexOffset);
 	vkCmdBindIndexBuffer(cmd, header->indexBuffer, header->indexOffset, VK_INDEX_TYPE_UINT16);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkGlobals.pipelineLayouts[k],
 		1, 1, &vkGlobals.litDescriptorSets[ctx->currentFrame], 1, &dynamicOffset);
 
 	drawLitMeshes(cmd, geo, header, k, primType, &p);
+}
+
+
+//
+// Custom shaders
+//
+
+struct CustomShader
+{
+	uint32 *vertSpv, *fragSpv;
+	size_t vertSize, fragSize;
+	VkShaderModule vert, frag;
+	// [depth mode][blend mode][0 = tri list, 1 = tri strip], built on first use
+	VkPipeline pipelines[4][PIPE_BLEND_COUNT][2];
+	CustomShader *next;
+};
+
+static void
+destroyCustomShaderPipelines(CustomShader *sh, bool32 modulesToo)
+{
+	Context *ctx = &vkGlobals.context;
+	if(ctx->device == VK_NULL_HANDLE)
+		return;
+	for(int z = 0; z < 4; z++)
+		for(int b = 0; b < PIPE_BLEND_COUNT; b++)
+			for(int p = 0; p < 2; p++)
+				if(sh->pipelines[z][b][p] != VK_NULL_HANDLE){
+					vkDestroyPipeline(ctx->device, sh->pipelines[z][b][p], nil);
+					sh->pipelines[z][b][p] = VK_NULL_HANDLE;
+				}
+	if(modulesToo){
+		if(sh->vert != VK_NULL_HANDLE)
+			vkDestroyShaderModule(ctx->device, sh->vert, nil);
+		if(sh->frag != VK_NULL_HANDLE)
+			vkDestroyShaderModule(ctx->device, sh->frag, nil);
+		sh->vert = VK_NULL_HANDLE;
+		sh->frag = VK_NULL_HANDLE;
+	}
+}
+
+CustomShader*
+createCustomShader(const uint32 *vertSpv, size_t vertSize, const uint32 *fragSpv, size_t fragSize)
+{
+	CustomShader *sh = rwNewT(CustomShader, 1, MEMDUR_EVENT | ID_DRIVER);
+	if(sh == nil)
+		return nil;
+	memset(sh, 0, sizeof(*sh));
+	// keep the code: modules and pipelines are rebuilt if the device is
+	sh->vertSpv = (uint32*)rwNew(vertSize, MEMDUR_EVENT | ID_DRIVER);
+	sh->fragSpv = (uint32*)rwNew(fragSize, MEMDUR_EVENT | ID_DRIVER);
+	if(sh->vertSpv == nil || sh->fragSpv == nil){
+		rwFree(sh->vertSpv);
+		rwFree(sh->fragSpv);
+		rwFree(sh);
+		return nil;
+	}
+	memcpy(sh->vertSpv, vertSpv, vertSize);
+	memcpy(sh->fragSpv, fragSpv, fragSize);
+	sh->vertSize = vertSize;
+	sh->fragSize = fragSize;
+	sh->next = vkGlobals.customShaders;
+	vkGlobals.customShaders = sh;
+	return sh;
+}
+
+void
+destroyCustomShader(CustomShader *shader)
+{
+	if(shader == nil)
+		return;
+	Context *ctx = &vkGlobals.context;
+	if(ctx->device != VK_NULL_HANDLE)
+		vkDeviceWaitIdle(ctx->device);
+	destroyCustomShaderPipelines(shader, 1);
+	CustomShader **pp = &vkGlobals.customShaders;
+	while(*pp && *pp != shader)
+		pp = &(*pp)->next;
+	if(*pp)
+		*pp = shader->next;
+	if(vkGlobals.custom.shader == shader)
+		vkGlobals.custom.shader = nil;
+	rwFree(shader->vertSpv);
+	rwFree(shader->fragSpv);
+	rwFree(shader);
+}
+
+static void
+destroyAllCustomShaderPipelines(bool32 modulesToo)
+{
+	for(CustomShader *sh = vkGlobals.customShaders; sh; sh = sh->next)
+		destroyCustomShaderPipelines(sh, modulesToo);
+}
+
+static VkPipeline
+getCustomPipeline(CustomShader *sh, int32 zmode, BlendPipelineMode blend, PrimitiveType primType)
+{
+	int p = primType == PRIMTYPETRISTRIP ? 1 : 0;
+	VkPipeline *slot = &sh->pipelines[zmode][blend][p];
+	if(*slot != VK_NULL_HANDLE)
+		return *slot;
+	if(sh->vert == VK_NULL_HANDLE)
+		sh->vert = createShaderModule(sh->vertSpv, sh->vertSize);
+	if(sh->frag == VK_NULL_HANDLE)
+		sh->frag = createShaderModule(sh->fragSpv, sh->fragSize);
+	if(sh->vert == VK_NULL_HANDLE || sh->frag == VK_NULL_HANDLE)
+		return VK_NULL_HANDLE;
+	VkVertexInputBindingDescription binding;
+	VkVertexInputAttributeDescription attribs[4];
+	makeIm3DVertexInput(&binding, attribs);
+	// depth state comes from the equivalent lit3d kind
+	createGraphicsPipeline((PipelineKind)(PIPE_LIT3D + zmode), blend, primType, sh->vert, sh->frag,
+		&binding, attribs, 4, vkGlobals.pipelineLayouts[PIPE_CUSTOM], slot);
+	return *slot;
+}
+
+InstanceDataHeader*
+customBeginAtomic(Atomic *atomic, CustomShader *shader, const float *custom, int32 numVec4s)
+{
+	vkGlobals.custom.shader = nil;
+	Geometry *geo = atomic->geometry;
+	if(shader == nil || geo == nil || geo->numVertices <= 0 || geo->meshHeader == nil)
+		return nil;
+	InstanceDataHeader *header = ensureInstanced(atomic);
+	if(header == nil || header->numMeshes == 0 || header->vertices == nil)
+		return nil;
+	PrimitiveType primType = (PrimitiveType)header->primType;
+	if(!validDrawState(PIPE_CUSTOM, primType) || !ensureLitUniformResources())
+		return nil;
+
+	Context *ctx = &vkGlobals.context;
+	VkCommandBuffer cmd = ctx->commandBuffers[ctx->currentFrame];
+	Lit3DUniforms u;
+	makeLitUniforms(atomic, &u, &vkGlobals.custom.push);
+	if(custom && numVec4s > 0){
+		if(numVec4s > CUSTOM_UNIFORM_VEC4S)
+			numVec4s = CUSTOM_UNIFORM_VEC4S;
+		memcpy(u.custom, custom, sizeof(float)*4*numVec4s);
+	}
+
+	if(header->isSkinned && Skin::get(geo)){
+		if(!bindSkinnedVertices(atomic, header))
+			return nil;
+	}else{
+		VkDeviceSize vertexOffset = header->vertexOffset;
+		vkCmdBindVertexBuffers(cmd, 0, 1, &header->vertexBuffer, &vertexOffset);
+	}
+	uint32 dynamicOffset;
+	if(!uploadLitUniforms(&u, &dynamicOffset))
+		return nil;
+	vkCmdBindIndexBuffer(cmd, header->indexBuffer, header->indexOffset, VK_INDEX_TYPE_UINT16);
+	VkPipelineLayout layout = vkGlobals.pipelineLayouts[PIPE_CUSTOM];
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
+		1, 1, &vkGlobals.litDescriptorSets[ctx->currentFrame], 1, &dynamicOffset);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
+		2, 1, &vkGlobals.whiteDescriptorSet, 0, nil);
+
+	PipelineKind k = selectLit3DPipelineKind();
+	vkGlobals.custom.shader = shader;
+	vkGlobals.custom.header = header;
+	vkGlobals.custom.geometry = geo;
+	vkGlobals.custom.zmode = k - PIPE_LIT3D;
+	vkGlobals.custom.primType = primType;
+	return header;
+}
+
+void
+customSetTexture1(Raster *raster)
+{
+	if(vkGlobals.custom.shader == nil)
+		return;
+	Context *ctx = &vkGlobals.context;
+	VkDescriptorSet set = raster ? getTextureDescriptor(raster) : vkGlobals.whiteDescriptorSet;
+	vkCmdBindDescriptorSets(ctx->commandBuffers[ctx->currentFrame], VK_PIPELINE_BIND_POINT_GRAPHICS,
+		vkGlobals.pipelineLayouts[PIPE_CUSTOM], 2, 1, &set, 0, nil);
+}
+
+void
+customDrawMesh(InstanceData *inst, const float *customPush)
+{
+	CustomShader *sh = vkGlobals.custom.shader;
+	if(sh == nil || inst == nil || inst->numIndex == 0)
+		return;
+	Context *ctx = &vkGlobals.context;
+	VkCommandBuffer cmd = ctx->commandBuffers[ctx->currentFrame];
+
+	RGBA white = { 255, 255, 255, 255 };
+	static const SurfaceProperties defaultSurfProps = { 1.0f, 0.0f, 1.0f };
+	Material *mat = inst->material;
+	RGBA matColor = white;
+	const SurfaceProperties *surf = &defaultSurfProps;
+	VkDescriptorSet tex = vkGlobals.whiteDescriptorSet;
+	Raster *texRaster = nil;
+	if(mat){
+		if(vkGlobals.custom.geometry->flags & Geometry::MODULATE)
+			matColor = mat->color;
+		surf = &mat->surfaceProps;
+		if(mat->texture && mat->texture->raster){
+			texRaster = mat->texture->raster;
+			tex = getTextureDescriptor(texRaster);
+		}
+	}
+	bool32 alpha = inst->vertexAlpha || matColor.alpha != 0xFF ||
+		getRenderStateUInt(VERTEXALPHA, 0) || rasterHasAlpha(texRaster);
+
+	VkPipeline pipeline = getCustomPipeline(sh, vkGlobals.custom.zmode, selectBlendMode(alpha),
+		vkGlobals.custom.primType);
+	if(pipeline == VK_NULL_HANDLE)
+		return;
+	if(vkGlobals.currentPipeline != pipeline){
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+		vkGlobals.currentPipeline = pipeline;
+	}
+
+	CustomPush p;
+	memcpy(&p, &vkGlobals.custom.push, sizeof(Lit3DPush));
+	colorToFloat(p.matColor, matColor);
+	p.surfProps[0] = surf->ambient;
+	p.surfProps[1] = surf->diffuse;
+	makeAlphaRef(p.alphaRef, alpha);
+	if(customPush)
+		memcpy(p.custom, customPush, sizeof(p.custom));
+	else
+		memset(p.custom, 0, sizeof(p.custom));
+	vkCmdPushConstants(cmd, vkGlobals.pipelineLayouts[PIPE_CUSTOM],
+		VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(p), &p);
+	bindTextureSet(PIPE_CUSTOM, tex);
+	vkCmdDrawIndexed(cmd, inst->numIndex, 1, inst->startIndex, 0, 0);
+}
+
+void
+customEndAtomic(void)
+{
+	vkGlobals.custom.shader = nil;
 }
 
 static ObjPipeline*

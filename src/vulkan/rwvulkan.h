@@ -174,6 +174,10 @@ struct VulkanRaster
 	bool32 gpuDirty;
 	bool32 gpuReady;
 	bool32 uploadSubmitted;
+	// camera texture render targets
+	VkFramebuffer framebuffer;
+	VkImageView framebufferDepthView;
+	VkFormat framebufferFormat;
 };
 
 struct InstanceData
@@ -221,6 +225,25 @@ public:
 
 	void (*renderCB)(Atomic *atomic);
 };
+
+// Custom shaders drawn like the lit pipeline (Neo vehicle, world, gloss, rim)
+//
+// Vertex input is Im3DVertex (location 0 position, 1 normal, 2 color, 3 uv).
+// Set 0 is texture 0, set 1 the per-atomic uniform block of lit3d.vert with
+// CUSTOM_UNIFORM_VEC4S extra vec4s at the end, set 2 texture 1. Push constants
+// are matColor, surfProps (x ambient, y diffuse, z lighting on), alphaRef and
+// one custom vec4 per mesh. Blending and depth follow the render states.
+enum { CUSTOM_UNIFORM_VEC4S = 16 };
+struct CustomShader;
+CustomShader *createCustomShader(const uint32 *vertSpv, size_t vertSize, const uint32 *fragSpv, size_t fragSize);
+void destroyCustomShader(CustomShader *shader);
+// Instances the atomic, fills and binds the standard uniforms plus `custom`
+// (numVec4s of them), binds its buffers (skinned geometry is skinned first).
+// Returns nil when the atomic can't be drawn.
+InstanceDataHeader *customBeginAtomic(Atomic *atomic, CustomShader *shader, const float *custom, int32 numVec4s);
+void customSetTexture1(Raster *raster);
+void customDrawMesh(InstanceData *inst, const float *customPush);
+void customEndAtomic(void);
 
 extern int32 nativeRasterOffset;
 #define GETVULKANRASTEREXT(raster) PLUGINOFFSET(rw::vulkan::VulkanRaster, raster, rw::vulkan::nativeRasterOffset)
