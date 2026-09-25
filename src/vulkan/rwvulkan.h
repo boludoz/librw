@@ -258,6 +258,15 @@ void customSetTexture1(Raster *raster);
 void customDrawMesh(InstanceData *inst, const float *customPush, const RGBA *matColor = nil);
 void customEndAtomic(void);
 
+// Im2D with a custom shader (post effects). Vertex input: location 0
+// position (vec4), 1 color, 2 uv and, with twoTexCoords, 3 a second uv that
+// follows the Im2DVertex fields in each vertex. Push constants: xform,
+// matColor, alphaRef and two custom vec4s. Set 0 is the TEXTURERASTER render
+// state, set 1 texture1. While a shader is set, rw::im2d draws use it.
+CustomShader *createCustomIm2DShader(const uint32 *vertSpv, size_t vertSize, const uint32 *fragSpv, size_t fragSize,
+	bool32 twoTexCoords = 0);
+void setIm2DCustomShader(CustomShader *shader, const float *custom = nil, Raster *texture1 = nil);
+
 extern int32 nativeRasterOffset;
 #define GETVULKANRASTEREXT(raster) PLUGINOFFSET(rw::vulkan::VulkanRaster, raster, rw::vulkan::nativeRasterOffset)
 

@@ -220,6 +220,14 @@ struct Im2DPushConstants
 	float alphaRef[4];
 };
 
+struct Im2DCustomPush
+{
+	float xform[4];
+	float matColor[4];
+	float alphaRef[4];
+	float custom[2][4];
+};
+
 struct Color3DPushConstants
 {
 	float mvp[16];
@@ -286,6 +294,7 @@ enum PipelineKind
 	PIPE_MATFX_ENVMAP_NOZTEST,
 	PIPE_MATFX_ENVMAP_NOZTEST_NOZWRITE,
 	PIPE_CUSTOM,	// layout only; pipelines live in each CustomShader
+	PIPE_CUSTOM_IM2D,	// same, for im2d custom shaders
 	PIPE_COUNT
 };
 
@@ -461,11 +470,28 @@ struct VulkanGlobals
 		PrimitiveType primType;
 		Lit3DPush push;
 	} custom;
+	struct {
+		CustomShader *shader;
+		float custom[2][4];
+		Raster *texture1;
+	} im2dCustom;
 };
 
 enum { PASS_NONE, PASS_SWAPCHAIN, PASS_OFFSCREEN };
 
 static VulkanGlobals vkGlobals;
+
+struct CustomShader
+{
+	uint32 *vertSpv, *fragSpv;
+	size_t vertSize, fragSize;
+	VkShaderModule vert, frag;
+	// [depth mode][blend mode][0 = tri list, 1 = tri strip], built on first use
+	VkPipeline pipelines[4][PIPE_BLEND_COUNT][2];
+	bool32 twoTexCoords;
+	bool32 im2d;
+	CustomShader *next;
+};
 
 static bool32
 vkOk(VkResult result, const char *what)
@@ -3181,6 +3207,26 @@ createCustomPipelineLayout(void)
 	            "vkCreatePipelineLayout(custom)");
 }
 
+static bool32
+createCustomIm2DPipelineLayout(void)
+{
+	Context *ctx = &vkGlobals.context;
+	VkPushConstantRange pushRange;
+	memset(&pushRange, 0, sizeof(pushRange));
+	pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+	pushRange.size = sizeof(Im2DCustomPush);
+	VkPipelineLayoutCreateInfo layoutInfo;
+	memset(&layoutInfo, 0, sizeof(layoutInfo));
+	layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	VkDescriptorSetLayout layouts[2] = { vkGlobals.textureSetLayout, vkGlobals.textureSetLayout };
+	layoutInfo.setLayoutCount = 2;
+	layoutInfo.pSetLayouts = layouts;
+	layoutInfo.pushConstantRangeCount = 1;
+	layoutInfo.pPushConstantRanges = &pushRange;
+	return vkOk(vkCreatePipelineLayout(ctx->device, &layoutInfo, nil, &vkGlobals.pipelineLayouts[PIPE_CUSTOM_IM2D]),
+	            "vkCreatePipelineLayout(custom im2d)");
+}
+
 // createDrawPipelines() creates every (kind x blend x primType) permutation up
 // front - a few hundred vkCreateGraphicsPipelines calls on a cold cache. A
 // VkPipelineCache shared across all of them lets the driver skip redundant
@@ -3417,7 +3463,8 @@ createDrawPipelines(void)
 	   !createMatFXPipelineLayout(PIPE_MATFX_ENVMAP_NOZWRITE) ||
 	   !createMatFXPipelineLayout(PIPE_MATFX_ENVMAP_NOZTEST) ||
 	   !createMatFXPipelineLayout(PIPE_MATFX_ENVMAP_NOZTEST_NOZWRITE) ||
-	   !createCustomPipelineLayout())
+	   !createCustomPipelineLayout() ||
+	   !createCustomIm2DPipelineLayout())
 		return 0;
 
 	VkVertexInputBindingDescription im2dBinding;
@@ -5956,40 +6003,48 @@ im2DRenderTriangle(void *vertices, int32, int32 vert1, int32 vert2, int32 vert3)
 	im2DRenderPrimitive(PRIMTYPETRILIST, tmp, 3);
 }
 
-static void
-im2DRenderPrimitive(PrimitiveType primType, void *vertices, int32 numVertices)
-{
-	PipelineKind k = selectIm2DPipelineKind();
-	if(!validDrawState(k, primType) || numVertices <= 0)
-		return;
+static VkPipeline getCustomIm2DPipeline(CustomShader *sh, int32 zmode, BlendPipelineMode blend, PrimitiveType primType);
 
+// Vertex stride of im2d draws: a custom shader may read a second uv after
+// the Im2DVertex fields.
+static uint32
+im2DVertexStride(void)
+{
+	CustomShader *sh = vkGlobals.im2dCustom.shader;
+	return sizeof(Im2DVertex) + (sh && sh->twoTexCoords ? sizeof(TexCoords) : 0);
+}
+
+// Pipeline, push constants and textures for an im2d draw
+static bool32
+im2DBindState(PipelineKind k, PrimitiveType primType, void *vertices, int32 numVertices)
+{
 	Context *ctx = &vkGlobals.context;
-	VkDeviceSize vertexSize = (VkDeviceSize)numVertices * sizeof(Im2DVertex);
-	VulkanBuffer *vertexBuffer = &vkGlobals.dynamicVertexBuffers[ctx->currentFrame];
-	VkDeviceSize vertexOffset;
-	if(!uploadDynamicBuffer(vertexBuffer, &vkGlobals.dynamicVertexOffset, vertices,
-		vertexSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 16, &vertexOffset))
-		return;
+	VkCommandBuffer cmd = ctx->commandBuffers[ctx->currentFrame];
+	uint32 stride = im2DVertexStride();
 
 	Raster *textureRaster = (Raster*)vkGlobals.renderStates[TEXTURERASTER];
 	bool32 vertexAlpha = 0;
-	Im2DVertex *verts = (Im2DVertex*)vertices;
-	for(int32 i = 0; i < numVertices; i++)
-		if(verts[i].a != 0xFF)
+	uint8 *v = (uint8*)vertices;
+	for(int32 i = 0; i < numVertices; i++, v += stride)
+		if(((Im2DVertex*)v)->a != 0xFF){
 			vertexAlpha = 1;
+			break;
+		}
 	bool32 alpha = vertexAlpha || rasterHasAlpha(textureRaster) || getRenderStateUInt(VERTEXALPHA, 0);
 
-	VkPipeline pipeline = getDrawPipeline(k, primType, alpha);
+	CustomShader *sh = vkGlobals.im2dCustom.shader;
+	PipelineKind layoutKind = sh ? PIPE_CUSTOM_IM2D : k;
+	VkPipeline pipeline = sh ?
+		getCustomIm2DPipeline(sh, k - PIPE_IM2D, selectBlendMode(alpha), primType) :
+		getDrawPipeline(k, primType, alpha);
+	if(pipeline == VK_NULL_HANDLE)
+		return 0;
 	if(vkGlobals.currentPipeline != pipeline){
-		vkCmdBindPipeline(ctx->commandBuffers[ctx->currentFrame],
-			VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 		vkGlobals.currentPipeline = pipeline;
 	}
-	VkBuffer vertexBuffers[] = { vertexBuffer->buffer };
-	VkDeviceSize offsets[] = { vertexOffset };
-	vkCmdBindVertexBuffers(ctx->commandBuffers[ctx->currentFrame], 0, 1, vertexBuffers, offsets);
 
-	Im2DPushConstants pc;
+	Im2DCustomPush pc;
 	Camera *cam = (Camera*)engine->currentCamera;
 	float w = cam && cam->frameBuffer ? (float)cam->frameBuffer->width : (float)ctx->swapchainExtent.width;
 	float h = cam && cam->frameBuffer ? (float)cam->frameBuffer->height : (float)ctx->swapchainExtent.height;
@@ -6000,9 +6055,40 @@ im2DRenderPrimitive(PrimitiveType primType, void *vertices, int32 numVertices)
 	RGBA white = { 255, 255, 255, 255 };
 	colorToFloat(pc.matColor, white);
 	makeAlphaRef(pc.alphaRef, alpha);
-	vkCmdPushConstants(ctx->commandBuffers[ctx->currentFrame], vkGlobals.pipelineLayouts[k],
-		VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-	bindTextureSet(k, getTextureDescriptor(textureRaster));
+	VkPipelineLayout layout = vkGlobals.pipelineLayouts[layoutKind];
+	if(sh){
+		memcpy(pc.custom, vkGlobals.im2dCustom.custom, sizeof(pc.custom));
+		vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+			0, sizeof(Im2DCustomPush), &pc);
+		VkDescriptorSet tex1 = vkGlobals.im2dCustom.texture1 ?
+			getTextureDescriptor(vkGlobals.im2dCustom.texture1) : vkGlobals.whiteDescriptorSet;
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &tex1, 0, nil);
+	}else
+		vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+			0, sizeof(Im2DPushConstants), &pc);
+	bindTextureSet(layoutKind, getTextureDescriptor(textureRaster));
+	return 1;
+}
+
+static void
+im2DRenderPrimitive(PrimitiveType primType, void *vertices, int32 numVertices)
+{
+	PipelineKind k = selectIm2DPipelineKind();
+	if(!validDrawState(k, primType) || numVertices <= 0)
+		return;
+
+	Context *ctx = &vkGlobals.context;
+	VkDeviceSize vertexSize = (VkDeviceSize)numVertices * im2DVertexStride();
+	VulkanBuffer *vertexBuffer = &vkGlobals.dynamicVertexBuffers[ctx->currentFrame];
+	VkDeviceSize vertexOffset;
+	if(!uploadDynamicBuffer(vertexBuffer, &vkGlobals.dynamicVertexOffset, vertices,
+		vertexSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 16, &vertexOffset))
+		return;
+	if(!im2DBindState(k, primType, vertices, numVertices))
+		return;
+	VkBuffer vertexBuffers[] = { vertexBuffer->buffer };
+	VkDeviceSize offsets[] = { vertexOffset };
+	vkCmdBindVertexBuffers(ctx->commandBuffers[ctx->currentFrame], 0, 1, vertexBuffers, offsets);
 	vkCmdDraw(ctx->commandBuffers[ctx->currentFrame], numVertices, 1, 0, 0);
 }
 
@@ -6014,7 +6100,7 @@ im2DRenderIndexedPrimitive(PrimitiveType primType, void *vertices, int32 numVert
 		return;
 
 	Context *ctx = &vkGlobals.context;
-	VkDeviceSize vertexSize = (VkDeviceSize)numVertices * sizeof(Im2DVertex);
+	VkDeviceSize vertexSize = (VkDeviceSize)numVertices * im2DVertexStride();
 	VkDeviceSize indexSize = (VkDeviceSize)numIndices * sizeof(uint16);
 	VulkanBuffer *vertexBuffer = &vkGlobals.dynamicVertexBuffers[ctx->currentFrame];
 	VulkanBuffer *indexBuffer = &vkGlobals.dynamicIndexBuffers[ctx->currentFrame];
@@ -6024,40 +6110,12 @@ im2DRenderIndexedPrimitive(PrimitiveType primType, void *vertices, int32 numVert
 	   !uploadDynamicBuffer(indexBuffer, &vkGlobals.dynamicIndexOffset, indices,
 		indexSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, 2, &indexOffset))
 		return;
-
-	Raster *textureRaster = (Raster*)vkGlobals.renderStates[TEXTURERASTER];
-	bool32 vertexAlpha = 0;
-	Im2DVertex *verts = (Im2DVertex*)vertices;
-	for(int32 i = 0; i < numVertices; i++)
-		if(verts[i].a != 0xFF)
-			vertexAlpha = 1;
-	bool32 alpha = vertexAlpha || rasterHasAlpha(textureRaster) || getRenderStateUInt(VERTEXALPHA, 0);
-
-	VkPipeline pipeline = getDrawPipeline(k, primType, alpha);
-	if(vkGlobals.currentPipeline != pipeline){
-		vkCmdBindPipeline(ctx->commandBuffers[ctx->currentFrame],
-			VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-		vkGlobals.currentPipeline = pipeline;
-	}
+	if(!im2DBindState(k, primType, vertices, numVertices))
+		return;
 	VkBuffer vertexBuffers[] = { vertexBuffer->buffer };
 	VkDeviceSize offsets[] = { vertexOffset };
 	vkCmdBindVertexBuffers(ctx->commandBuffers[ctx->currentFrame], 0, 1, vertexBuffers, offsets);
 	vkCmdBindIndexBuffer(ctx->commandBuffers[ctx->currentFrame], indexBuffer->buffer, indexOffset, VK_INDEX_TYPE_UINT16);
-
-	Im2DPushConstants pc;
-	Camera *cam = (Camera*)engine->currentCamera;
-	float w = cam && cam->frameBuffer ? (float)cam->frameBuffer->width : (float)ctx->swapchainExtent.width;
-	float h = cam && cam->frameBuffer ? (float)cam->frameBuffer->height : (float)ctx->swapchainExtent.height;
-	pc.xform[0] = 2.0f/w;
-	pc.xform[1] = 2.0f/h;
-	pc.xform[2] = -1.0f;
-	pc.xform[3] = -1.0f;
-	RGBA white = { 255, 255, 255, 255 };
-	colorToFloat(pc.matColor, white);
-	makeAlphaRef(pc.alphaRef, alpha);
-	vkCmdPushConstants(ctx->commandBuffers[ctx->currentFrame], vkGlobals.pipelineLayouts[k],
-		VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-	bindTextureSet(k, getTextureDescriptor(textureRaster));
 	vkCmdDrawIndexed(ctx->commandBuffers[ctx->currentFrame], numIndices, 1, 0, 0, 0);
 }
 
@@ -7280,16 +7338,6 @@ skinRenderCB(Atomic *atomic)
 // Custom shaders
 //
 
-struct CustomShader
-{
-	uint32 *vertSpv, *fragSpv;
-	size_t vertSize, fragSize;
-	VkShaderModule vert, frag;
-	// [depth mode][blend mode][0 = tri list, 1 = tri strip], built on first use
-	VkPipeline pipelines[4][PIPE_BLEND_COUNT][2];
-	bool32 twoTexCoords;
-	CustomShader *next;
-};
 
 static void
 destroyCustomShaderPipelines(CustomShader *sh, bool32 modulesToo)
@@ -7357,6 +7405,8 @@ destroyCustomShader(CustomShader *shader)
 		*pp = shader->next;
 	if(vkGlobals.custom.shader == shader)
 		vkGlobals.custom.shader = nil;
+	if(vkGlobals.im2dCustom.shader == shader)
+		vkGlobals.im2dCustom.shader = nil;
 	rwFree(shader->vertSpv);
 	rwFree(shader->fragSpv);
 	rwFree(shader);
@@ -7546,6 +7596,68 @@ void
 customEndAtomic(void)
 {
 	vkGlobals.custom.shader = nil;
+}
+
+CustomShader*
+createCustomIm2DShader(const uint32 *vertSpv, size_t vertSize, const uint32 *fragSpv, size_t fragSize,
+	bool32 twoTexCoords)
+{
+	CustomShader *sh = createCustomShader(vertSpv, vertSize, fragSpv, fragSize, twoTexCoords);
+	if(sh)
+		sh->im2d = 1;
+	return sh;
+}
+
+void
+setIm2DCustomShader(CustomShader *shader, const float *custom, Raster *texture1)
+{
+	if(shader && !shader->im2d)
+		shader = nil;
+	vkGlobals.im2dCustom.shader = shader;
+	if(custom)
+		memcpy(vkGlobals.im2dCustom.custom, custom, sizeof(vkGlobals.im2dCustom.custom));
+	else
+		memset(vkGlobals.im2dCustom.custom, 0, sizeof(vkGlobals.im2dCustom.custom));
+	vkGlobals.im2dCustom.texture1 = texture1;
+}
+
+static VkPipeline
+getCustomIm2DPipeline(CustomShader *sh, int32 zmode, BlendPipelineMode blend, PrimitiveType primType)
+{
+	int p = primType == PRIMTYPETRISTRIP ? 1 : 0;
+	if(primType != PRIMTYPETRILIST && primType != PRIMTYPETRISTRIP)
+		return VK_NULL_HANDLE;
+	VkPipeline *slot = &sh->pipelines[zmode][blend][p];
+	if(*slot != VK_NULL_HANDLE)
+		return *slot;
+	if(sh->vert == VK_NULL_HANDLE)
+		sh->vert = createShaderModule(sh->vertSpv, sh->vertSize);
+	if(sh->frag == VK_NULL_HANDLE)
+		sh->frag = createShaderModule(sh->fragSpv, sh->fragSize);
+	if(sh->vert == VK_NULL_HANDLE || sh->frag == VK_NULL_HANDLE)
+		return VK_NULL_HANDLE;
+
+	VkVertexInputBindingDescription binding;
+	memset(&binding, 0, sizeof(binding));
+	binding.stride = sizeof(Im2DVertex) + (sh->twoTexCoords ? sizeof(TexCoords) : 0);
+	binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+	VkVertexInputAttributeDescription attribs[4];
+	memset(attribs, 0, sizeof(attribs));
+	attribs[0].location = 0;
+	attribs[0].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+	attribs[0].offset = offsetof(Im2DVertex, x);
+	attribs[1].location = 1;
+	attribs[1].format = VK_FORMAT_R8G8B8A8_UNORM;
+	attribs[1].offset = offsetof(Im2DVertex, r);
+	attribs[2].location = 2;
+	attribs[2].format = VK_FORMAT_R32G32_SFLOAT;
+	attribs[2].offset = offsetof(Im2DVertex, u);
+	attribs[3].location = 3;
+	attribs[3].format = VK_FORMAT_R32G32_SFLOAT;
+	attribs[3].offset = sizeof(Im2DVertex);
+	createGraphicsPipeline((PipelineKind)(PIPE_IM2D + zmode), blend, primType, sh->vert, sh->frag,
+		&binding, attribs, sh->twoTexCoords ? 4 : 3, vkGlobals.pipelineLayouts[PIPE_CUSTOM_IM2D], slot);
+	return *slot;
 }
 
 static ObjPipeline*
